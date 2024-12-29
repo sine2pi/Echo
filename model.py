@@ -726,17 +726,17 @@ class Echo(WhisperPreTrainedModel, PyTorchModelHubMixin):
     transcribe = transcribe_function
     decode = decode_function
 
-    def get_encoder(self):
-        return self.encoder
+    # def get_encoder(self):
+    #     return self.encoder
     
-    def get_decoder(self):
-        return self.decoder, self.config.decoder_start_token_id
+    # def get_decoder(self):
+    #     return self.decoder, self.config.decoder_start_token_id
     
-    def get_output_embeddings(self):
-        return self.decoder.token_embedding, self.decoder.positional_embedding, self.decoder.combined_rotary
+    # def get_output_embeddings(self):
+    #     return self.decoder.token_embedding, self.decoder.positional_embedding, self.decoder.combined_rotary
     
-    def get_input_embeddings(self):
-        return self.encoder.combined_rotary, self.encoder.positional_embedding, self.encoder.conv1, self.encoder.conv2
+    # def get_input_embeddings(self):
+    #     return self.encoder.combined_rotary, self.encoder.positional_embedding, self.encoder.conv1, self.encoder.conv2
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return {'input_features': input_ids}
