@@ -81,79 +81,6 @@ class LayerNorm(nn.Module):
         x = (x - mean) / (std + self.eps)
         return self.gamma * x + self.beta
 
-class BiasedCrossAttention(nn.Module):
-    def __init__(self, n_state, n_head, dropout_rate=0.001):
-        super().__init__()
-        self.n_head = n_head
-        self.n_state = n_state
-        self.head_dim = n_state // n_head
-
-        self.query = nn.Linear(in_features=n_state, out_features=n_state)
-        self.key = nn.Linear(in_features=n_state, out_features=n_state, bias=False)
-        self.value = nn.Linear(in_features=n_state, out_features=n_state)
-        self.out = nn.Linear(in_features=n_state, out_features=n_state)
-
-        self.bias = nn.Parameter(data=torch.zeros(n_head, 1, self.head_dim))
-        self.dropout = nn.Dropout(p=dropout_rate)
-        self.norm = LayerNorm(num_features=n_state)
-        
-    def forward(self, q, k, v, mask=None):
-        batch_size, seq_length, _ = q.size()
-
-        q = self.query(q).view(batch_size, seq_length, self.n_head, self.head_dim)
-        k = self.key(k).view(batch_size, seq_length, self.n_head, self.head_dim)
-        v = self.value(v).view(batch_size, seq_length, self.n_head, self.head_dim)
-
-        qk = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5) + self.bias
-        if mask is not None:
-            qk = qk.masked_fill(mask == 0, float('-inf'))
-
-        w = F.softmax(qk, dim=-1)
-        w = self.dropout(w)
-
-        out = (w @ v).transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
-        out = self.norm(self.out(out) + q.view(batch_size, seq_length, -1))
-        return out
-
-class DynamicConvAttention(nn.Module):
-    def __init__(self, n_state, n_head, kernel_size=3):
-        super().__init__()
-        self.n_state = n_state
-        self.n_head = n_head
-        self.kernel_size = kernel_size
-
-        self.conv = nn.Conv1d(in_channels=n_state, out_channels=n_state, kernel_size=kernel_size, padding=kernel_size // 2, groups=n_head)
-
-
-        self.query = nn.Linear(in_features=n_state, out_features=n_state)
-        self.key = nn.Linear(in_features=n_state, out_features=n_state, bias=False)
-        self.value = nn.Linear(in_features=n_state, out_features=n_state)
-        self.out_proj = nn.Linear(in_features=n_state, out_features=n_state)
-
-        self.norm = LayerNorm(num_features=n_state)
-
-    def forward(self, x):
-        batch_size, seq_len, embed_dim = x.size()
-        if embed_dim != self.n_state:
-            raise ValueError(f"Expected embed_dim of {self.n_state}, but got {embed_dim}")
-
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
-
-        x = x.permute(0, 2, 1)
-        conv_out = self.conv(x)
-        conv_out = conv_out.permute(0, 2, 1)
-        conv_out = self.norm(conv_out)
-        conv_out = self.dropout(conv_out)
-
-        attention_out = F.softmax(input=torch.matmul(input=q, other=k.transpose(-2, -1)) / (self.n_state ** 0.5), dim=-1)
-        attention_out = torch.matmul(input=attention_out, other=v)
-        
-        combined_out = conv_out + attention_out
-        combined_out = self.norm(combined_out)
-        
-        return self.out_proj(combined_out) + x.permute(0, 2, 1)
 
 class CombinedRotaryEmbedding(nn.Module):
     def __init__(self, n_state, n_head, num_rotations, base=10000, checkpointing=False):
@@ -893,7 +820,7 @@ class MetricsCallback(TrainerCallback):
                     adjusted_base = model.adjust_base(loss)
                     print(f"Adjusted base: {adjusted_base}")
 
-                    if self.config.use_hybrid_attention:
+                    if model.config.use_hybrid_attention:
                         print(f"Current Loss: {loss:.4f}, Window Scale: {model.encoder.blocks[0].attn.window_scale.item():.4f}")
 
         if self.predictions is not None and self.label_ids is not None:
