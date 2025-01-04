@@ -260,44 +260,122 @@ class LearnedSinusoidalEmbeddings(nn.Module):
             position_embeddings = self.positional_embeddings[positions]
         position_embeddings = torch.nn.functional.normalize(input=position_embeddings, p=2, dim=-1)
         return position_embeddings
-    
-class AdaptiveSpanAttention(nn.Module):
-    def __init__(self, n_state, n_head, max_span=50):
+
+@contextmanager
+def disable_sdpa():
+    prev_state = MultiheadAttention.use_sdpa
+    try:
+        MultiheadAttention.use_sdpa = False
+        yield
+    finally:
+        MultiheadAttention.use_sdpa = prev_state
+
+class MultiheadAttention(nn.Module):
+    use_sdpa = False
+
+    def __init__(self, n_state: int, n_head: int, max_rel_dist=1, base=10000):
         super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(n_state, n_head)  # Custom version
-        self.max_span = max_span
-        self.span_scale = nn.Parameter(torch.tensor(1.0))
+        assert n_state % n_head == 0, "n_state must be divisible by n_head"
+        self.n_head = n_head
+        self.h_dim = n_state // n_head
+        assert self.h_dim % 2 == 0, "Head dimension must be even for rotary embeddings"
 
-    def forward(self, query, key, value):
-        span_length = int(self.max_span * self.span_scale.item())
-        query_span = query[:, :span_length, :]
-        key_span = key[:, :span_length, :]
-        value_span = value[:, :span_length, :]
-        attn_output, attn_weights = self.multihead_attn(query_span, key_span, value_span)
-        return attn_output, attn_weights
+        self.positional_scaling = nn.Parameter(torch.ones(1))
 
-class RecurrentAttention(nn.Module):
-    def __init__(self, n_state, n_head, chunk_size):
-        super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(n_state, n_head)
-        self.chunk_size = chunk_size
+        self.query = nn.Linear(in_features=n_state, out_features=n_state)
+        self.key = nn.Linear(in_features=n_state, out_features=n_state, bias=False)
+        self.value = nn.Linear(in_features=n_state, out_features=n_state)
+        self.out = nn.Linear(in_features=n_state, out_features=n_state)
+        self.kv_cache = {}
 
-    def forward(self, query, key, value):
-        batch_size, seq_len, n_state = query.size()
-        output = torch.zeros_like(query)
-        
-        for i in range(0, seq_len, self.chunk_size):
-            query_chunk = query[:, i:i + self.chunk_size, :]
-            key_chunk = key[:, i:i + self.chunk_size, :]
-            value_chunk = value[:, i:i + self.chunk_size, :]
-            
-            if query_chunk.size(1) > 0 and key_chunk.size(1) > 0 and value_chunk.size(1) > 0:
-                attn_output, attn_weights = self.multihead_attn(query_chunk, key_chunk, value_chunk)
-                
-                output[:, i:i + self.chunk_size, :] = attn_output
+        self.max_rel_dist = max_rel_dist
+        self.base = base
 
-        return output
+        inv_freq = 1.0 / (self.base ** (torch.arange(start=0, end=self.h_dim, step=2).float() / self.h_dim))
+        self.register_buffer(name='inv_freq', tensor=inv_freq)
 
+        self.rel_pos_bias = nn.Parameter(torch.zeros((2 * self.max_rel_dist - 1, self.n_head)))
+
+        self.combined_rotary = CombinedRotaryEmbedding(
+            n_state=n_state,
+            n_head=n_head,
+            num_rotations=self.h_dim // 2, 
+            base=base,
+            checkpointing=False  
+        )
+
+    def update_base(self, new_base):
+        self.base = float(new_base)
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.h_dim, 2).float() / self.h_dim)) 
+        self.register_buffer('inv_freq', inv_freq) 
+        self.combined_rotary.update_base(self.base)
+
+    def forward(
+        self,
+        x: Tensor,
+        xa: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+        kv_cache: Optional[dict] = None,
+    ):
+        q = self.query(x)
+
+        if kv_cache is None or xa is None or self.key not in kv_cache:
+            k = self.key(x if xa is None else xa)
+            v = self.value(x if xa is None else xa)
+        else:
+
+            k = kv_cache[self.key]
+            v = kv_cache[self.value]
+
+        q = self.combined_rotary(q) * self.positional_scaling
+        k = self.combined_rotary(k) * self.positional_scaling
+
+        wv, qk = self.qkv_attention(q, k, v, mask)
+        return self.out(wv), qk
+
+    def qkv_attention(
+        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        n_batch, n_ctx, n_state = q.shape
+
+        scale = (n_state // self.n_head) ** -0.25
+        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+        v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+
+        if SDPA_AVAILABLE and MultiheadAttention.use_sdpa:
+            a = scaled_dot_product_attention(
+                q, k, v, is_causal=mask is not None and n_ctx > 1
+            )
+            out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+            qk = None
+        else:
+            L, S = q.size(-2), k.size(-2)
+            scale_factor = 1 / math.sqrt(q.size(-1)) if scale is None else scale
+            attn_bias = torch.zeros(L, S, dtype=q.dtype)
+            w = q @ k.transpose(-2, -1) * scale_factor
+            w += attn_bias.to(q.dtype).to(device)
+            w = torch.softmax(w, dim=-1).to(q.dtype)
+
+            qk = (q * scale) @ (k * scale).transpose(-1, -2)
+
+            if mask is not None:
+                qk = qk + mask[:n_ctx, :n_ctx]
+
+            qk = qk.float()
+            out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
+            qk = qk.detach()
+
+        seq_len_q = q.size(2)
+        seq_len_k = k.size(2)
+
+        positions = torch.arange(end=seq_len_q, device=q.device).unsqueeze(dim=1) - torch.arange(end=seq_len_k, device=q.device).unsqueeze(dim=0)
+        positions = positions.clamp(min=-self.max_rel_dist + 1, max=self.max_rel_dist - 1) + self.max_rel_dist - 1
+        rel_bias = self.rel_pos_bias[positions]
+        rel_bias = rel_bias.permute(2, 0, 1).unsqueeze(0)
+        qk = qk + rel_bias
+
+        return out, qk
 
 class SparseAttention(nn.Module):
     def __init__(self, n_state, n_head, sparsity_factor):
@@ -327,111 +405,59 @@ class SparseAttention(nn.Module):
         attn_output, attn_weights = self.multihead_attn(query_sparse, key_sparse, value_sparse)
         return attn_output, attn_weights
 
-class MultiheadAttention(nn.Module):
-    use_sdpa = True
-
-    def __init__(self, n_state, n_head, max_rel_dist = 1, base = 10000):
+class AdaptiveSpanAttention(nn.Module):
+    def __init__(self, n_state, n_head, max_span):
         super().__init__()
-        assert n_state % n_head == 0, "n_state must be divisible by n_head"
-        self.n_head = n_head
-        self.h_dim = n_state // n_head
-        assert self.h_dim % 2 == 0, "Head dimension must be even for rotary embeddings"
+        self.multihead_attn = MultiheadAttention(n_state, n_head) 
+        self.max_span = max_span
+        self.span_scale = nn.Parameter(torch.tensor(1.0))
 
-        self.positional_scaling = nn.Parameter(torch.ones(1))
+    def forward(self, query, key, value):
+        span_length = int(self.max_span * self.span_scale.item())
+        span_length = min(span_length, query.shape[1])
+        query_span = query[:, :span_length, :]
+        key_span = key[:, :span_length, :]
+        value_span = value[:, :span_length, :]
+        attn_output, attn_weights = self.multihead_attn(query_span, key_span, value_span) # Changed
+        return attn_output, attn_weights
 
-        self.query = nn.Linear(in_features=n_state, out_features=n_state)
-        self.key = nn.Linear(in_features=n_state, out_features=n_state, bias=False)
-        self.value = nn.Linear(in_features=n_state, out_features=n_state)
-        self.out = nn.Linear(in_features=n_state, out_features=n_state)
+class RecurrentAttention(nn.Module):
+    def __init__(self, n_state, n_head, chunk_size):
+        super().__init__()
+        self.multihead_attn = MultiheadAttention(n_state, n_head)
+        self.chunk_size = chunk_size
 
-        self.max_rel_dist = max_rel_dist
-        self.base = base
+    def forward(self, query, key, value, kv_cache=None):
+        batch_size, seq_len, n_state = query.size()  # Correct shape
+        output = torch.zeros_like(query).to(query.device)
 
-        inv_freq = 1.0 / (self.base ** (torch.arange(start=0, end=self.h_dim, step=2).float() / self.h_dim))
-        self.register_buffer(name='inv_freq', tensor=inv_freq)
+        if kv_cache is None:
+            kv_cache = {}
 
-        self.rel_pos_bias = nn.Embedding(num_embeddings=2 * self.max_rel_dist - 1, embedding_dim=self.n_head)
-        self.rel_pos_bias.weight.data.fill_(value=0)
+        key_global = key
+        value_global = value
 
-        self.combined_rotary = CombinedRotaryEmbedding(
-            n_state=n_state,
-            n_head=n_head,
-            num_rotations=self.h_dim // 2,
-            base=base,
-            checkpointing=False 
-        )
+        for i in range(0, seq_len, self.chunk_size):
+            end = min(seq_len, i + self.chunk_size)
+            query_chunk = query[:, i:end, :]  
 
-        if device:
-            self.to(device=device)
-            
-    def update_base(self, new_base): 
-        self.base = float(new_base)
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.h_dim, 2).float() / self.h_dim)) 
-        self.register_buffer('inv_freq', inv_freq) 
-        self.combined_rotary.update_base(self.base)
+            if 'k' not in kv_cache:
+                kv_cache['k'] = key_global.clone().detach().to(query.device)
+                kv_cache['v'] = value_global.clone().detach().to(query.device)
 
-    def forward(self, x, xa=None, mask=None, kv_cache=None):
-        q = self.query(x)
+            key_chunk = kv_cache['k'][:, :end, :]
+            value_chunk = kv_cache['v'][:, :end, :]
 
-        if kv_cache is None or xa is None or 'k' not in kv_cache:
-            k_input = x if xa is None else xa
-            k = self.key(k_input)
-            v = self.value(k_input)
-            if kv_cache is not None:
-                kv_cache['k'] = k
-                kv_cache['v'] = v
-        else:
-            k = kv_cache['k']
-            v = kv_cache['v']
+            attn_output, _ = self.multihead_attn(query_chunk, key_chunk, value_chunk)
+            output[:, i:end, :] = attn_output
 
-        q = q.view(q.shape[0], q.shape[1], self.n_head, -1)
-        k = k.view(k.shape[0], k.shape[1], self.n_head, -1)
-        v = v.view(v.shape[0], v.shape[1], self.n_head, -1)
-        
-        q = self.combined_rotary(q) 
-        k = self.combined_rotary(k)
-
-        q = q.view(q.shape[0], q.shape[1], -1)
-        k = k.view(k.shape[0], k.shape[1], -1)
-
-        wv, qk = self.qkv_attention(q=q, k=k, v=v, mask=mask)
-        return self.out(wv), qk
-
-        
-    def qkv_attention(self, q, k, v, mask=None):
-        n_batch, n_ctx, n_state = q.shape
-
-        scale = (n_state // self.n_head) ** -0.25
-        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-        v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-
-        qk = (q * scale) @ (k * scale).transpose(-1, -2)
-
-        seq_len_q = q.size(2)
-        seq_len_k = k.size(2)
-
-        positions = torch.arange(end=seq_len_q, device=q.device).unsqueeze(dim=1) - torch.arange(end=seq_len_k, device=q.device).unsqueeze(dim=0)
-        positions = positions.clamp(min=-self.max_rel_dist + 1, max=self.max_rel_dist - 1) + self.max_rel_dist - 1
-        rel_bias = self.rel_pos_bias(positions)
-        rel_bias = rel_bias.permute(2, 0, 1).unsqueeze(0)
-        qk = qk + rel_bias
-
-        if mask is not None:
-            qk = qk + mask[:n_ctx, :n_ctx]
-        qk = qk.float()
-
-        w = F.softmax(input=qk, dim=-1).to(dtype=q.dtype)
-        out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-        qk = qk.detach()
-        return out, qk
-
+        return output, kv_cache
 
 class HybridAttention(nn.Module):
     def __init__(self, n_state, n_head, window_size=40, alpha=0.001, sparsity_factor=0.333, 
                  max_span=50, chunk_size=50, max_rel_dist=1, base=10000, loss=None):
         super().__init__()
-        self.local_attn = AdaptiveSpanAttention(n_state, n_head,  max_span)
+        self.local_attn = AdaptiveSpanAttention(n_state, n_head, max_span)
         self.global_attn = RecurrentAttention(n_state, n_head, chunk_size)
         self.ln_local = nn.LayerNorm(n_state)
         self.ln_global = nn.LayerNorm(n_state)
@@ -439,25 +465,41 @@ class HybridAttention(nn.Module):
         self.loss = loss
         self.window_scale = nn.Parameter(torch.tensor(float(window_size)))  
         self.best_loss = float('inf')
+        self.projection = nn.Linear(2 * n_state, n_state) 
 
     def update_window(self, new_window):
-        self.window_size = int(new_window)
+        new_window = max(1, int(new_window + 0.5))
+        self.window_size = new_window
+        self.local_attn.max_span = new_window
+        self.global_attn.chunk_size = new_window
 
     def forward(self, x, loss=None):
         if loss is not None:
-            window_size = self.update_window(loss)
-        else:
-            window_size = self.window_size
+            self.update_window(loss)
+        window_size = self.window_size 
 
         x_local = self.ln_local(x)
         x_global = self.ln_global(x)
+
         x_local = x_local.permute(1, 0, 2)
         x_global = x_global.permute(1, 0, 2)
 
         local_out = self.sliding_window_attention(x_local, window_size)
-        global_out = self.global_attn(x_global, x_global, x_global)
-        combined_out = local_out + global_out
+        kv_cache = {}
+        global_out, _ = self.global_attn(x_global, x_global, x_global, kv_cache=kv_cache)
+
+        if local_out.shape[1] != global_out.shape[1]:
+            seq_len_diff = local_out.shape[1] - global_out.shape[1]
+            if seq_len_diff > 0: 
+                local_out = local_out[:, :global_out.shape[1], :]
+            elif seq_len_diff < 0:
+                pad = (0, 0, 0, -seq_len_diff, 0, 0) 
+                local_out = F.pad(local_out, pad).to(local_out.device)
+
+        combined = torch.cat([local_out, global_out], dim=-1)
+        combined_out = self.projection(combined)
         combined_out = combined_out.permute(1, 0, 2)
+
         return combined_out
 
     def sliding_window_attention(self, x, window_size):
@@ -472,6 +514,7 @@ class HybridAttention(nn.Module):
             value = x[start:end, :, :]
             attn_output, _ = self.local_attn(query, key, value)
             output[i:end, :, :] = attn_output[:end - i, :, :]
+
         return output
 
 class ResidualAttentionBlock(nn.Module):
@@ -501,14 +544,14 @@ class ResidualAttentionBlock(nn.Module):
 
     def forward(self, x, xa=None, mask=None, loss=None, kv_cache=None):
         if self.checkpointing:
-            x = checkpoint(self._attn_forward, x, mask, loss, kv_cache)
+            x = checkpoint(self._attn_forward, x, mask, loss)
         else:
-            x = self._attn_forward(x, mask, loss, kv_cache)
+            x = self._attn_forward(x, mask, loss, kv_cache=None)
         if self.cross_attn:
             if self.checkpointing:
-                x = checkpoint(self._cross_attn_forward, x, xa, kv_cache)
+                x = checkpoint(self._cross_attn_forward, x, xa, kv_cache=None)
             else:
-                x = self._cross_attn_forward(x, xa, kv_cache)
+                x = self._cross_attn_forward(x, xa, kv_cache=None)
         if self.checkpointing:
             x = checkpoint(self._mlp_forward, x)
         else:
@@ -581,7 +624,7 @@ class EnhancedResidualAttentionBlock(nn.Module):
         residual = x
         x = self.attn_ln(x)
         if isinstance(self.attn, HybridAttention):
-            x = residual + self.attn(x, loss)[0]
+            x = residual + self.attn(x, loss, kv_cache=None)[0]
         else:
             x = residual + self.attn(x, mask=mask, kv_cache=kv_cache)[0]
         return x
@@ -730,70 +773,6 @@ class TextDecoder(nn.Module):
         x = x.view(batch_size, seq_length, embedding_dim)
         return x
     
-
-
-class AutonomicLayer(nn.Module):
-    def __init__(self, encoder, decoder, alpha=0.0001, beta=0.9, factor=1.005, threshold=0.01, window_size=40, base=10000):
-        super(AutonomicLayer, self).__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.best_loss = float('inf')
-        self.base = base
-        self.window_size = window_size
-        self.adjust_counter = 0
-        self.alpha = alpha
-        self.beta = beta
-        self.factor = factor
-        self.threshold = threshold
-        self.running_loss = None
-
-
-    def update_base(self, new_base):
-        self.base = new_base
-        for name, module in self.encoder.named_modules():
-            if isinstance(module, (MultiheadAttention, CombinedRotaryEmbedding, AudioEncoder)):
-                module.update_base(self.base)
-        for name, module in self.decoder.named_modules():
-            if isinstance(module, (MultiheadAttention, CombinedRotaryEmbedding, TextDecoder)):
-                module.update_base(self.base)
-
-    def adjust_base(self, loss, factor=1.0005):
-        self.adjust_counter += 1 
-        if loss < self.best_loss:
-            new_base = self.base * factor
-        else:
-            new_base = self.base / factor
-        self.update_base(new_base=new_base)
-        self.best_loss = loss
-        return new_base
-
-    def update_window(self, new_window):
-        self.window_size = new_window
-        for name, module in self.encoder.named_modules():
-            if isinstance(module, HybridAttention):
-                module.update_window(self.window_size)
-        for name, module in self.decoder.named_modules():
-            if isinstance(module, HybridAttention):
-                module.update_window(self.window_size)
-    
-    def adjust_window(self, loss, factor=1.0005):
-        self.adjust_counter += 1 
-        if loss < self.best_loss:
-            new_window = self.window_size * factor
-        else:
-            new_window = self.window_size / factor
-        self.update_window(new_window=new_window)
-        self.best_loss = loss
-        return new_window
-
-    def forward(self, x):
-        self.adjust_counter += 1
-        if self.adjust_counter % 10 == 0:
-            print(f"Iteration {self.adjust_counter}: Current base: {self.base}, Current window size: {self.window_size}")
-        return x
-
-
-
 class EchoConfig(PretrainedConfig):
     model_type = "Echo"
     def __init__(
@@ -855,7 +834,6 @@ class Echo(PreTrainedModel):
     def __init__(self, config: EchoConfig):
         super().__init__(config)
         config = EchoConfig
-
         self.encoder = AudioEncoder(
             n_mels=self.config.n_mels,
             n_ctx=self.config.n_audio_ctx,
@@ -891,6 +869,7 @@ class Echo(PreTrainedModel):
     window_size=config.window_size
     adjust_counter = 0
     best_loss = float('inf')
+    kv_cache = {}
 
     def update_base(self, new_base):
         self.base = new_base
@@ -1115,8 +1094,6 @@ feature_extractor = WhisperFeatureExtractor.from_pretrained(pretrained_model_nam
 tokenizer = WhisperTokenizerFast.from_pretrained(pretrained_model_name_or_path="D:/newproject/my_tokenizer")
 processor = WhisperProcessor.from_pretrained(pretrained_model_name_or_path="D:/newproject/my_processor")
 
-
-
 class GradientClippingCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         torch.nn.utils.clip_grad_norm_(parameters=kwargs["model"].parameters(), max_norm=0.98)
@@ -1163,13 +1140,6 @@ class MetricsCallback(TrainerCallback):
                     print(f"Label: {label_str[sample_index]}")
                     print("-" * 30)
 
-            # eval_loss = eval_loss if eval_loss is not None else 0.0
-            # adjusted_base = adjusted_base if adjusted_base is not None else 0.0
-            # if config.use_hybrid_attention:
-            #     adjusted_window_size = adjusted_window_size if adjusted_window_size is not None else 0.0
-
-            #print(f"Step {state.global_step} - Eval Loss: {eval_loss:.4f} - Sample Prediction: {pred_str[sample_index]} - Sample Label: {label_str[sample_index]} - Adjusted Base: {adjusted_base:.4f}")# - Adjusted Window Size: {adjusted_window_size:.4f}")
-
         self.predictions = None
         self.label_ids = None
 
@@ -1201,9 +1171,7 @@ def create_compute_metrics(callback_instance):
         precision = precision_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], average='weighted', zero_division=0)
         recall = recall_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], average='weighted', zero_division=0)
         f1 = f1_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], average='weighted', zero_division=0)
-
         return {"cer": cer, "accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
-    
     return compute_metrics
 
 @dataclass
@@ -1238,20 +1206,21 @@ def prepare_dataset(batch):
     batch["labels"] = tokenizer(transcription).input_ids
     return batch
 
-####  -- Sanity Check
+token = "hf_token"
 
-test = load_dataset(path="audiofolder", data_dir="D:/projold/datasets/gv_test")["train"] \
-        .map(prepare_dataset).select_columns(["input_features", "labels"]).take(1)
+train  = load_dataset("mozilla-foundation/common_voice_17_0", "ja", split="train",
+                    streaming=True, 
+                    token=token, 
+                    trust_remote_code=True)\
+        .cast_column("audio", Audio(sampling_rate=16000))\
+        .map(prepare_dataset).select_columns(["input_features", "labels"])
 
-train = load_dataset(path="audiofolder", data_dir="D:/projold/datasets/gv_test")["train"] \
-        .map(prepare_dataset).select_columns(["input_features", "labels"]).take(1)
-
-# train = load_dataset(path="audiofolder", data_dir="D:/proj/datasets/gv")["train"] \
-#         .take(1000) \
-#         .to_iterable_dataset(num_shards=200) \
-#         .map(prepare_dataset).select_columns(["input_features", "labels"])
-
-
+test = load_dataset("mozilla-foundation/common_voice_17_0", "ja", split="test", 
+                    streaming=True, 
+                    token=token, 
+                    trust_remote_code=True)\
+        .cast_column("audio", Audio(sampling_rate=16000))\
+        .map(prepare_dataset).select_columns(["input_features", "labels"])
 
 data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor, tokenizer=tokenizer, feature_extractor=feature_extractor)
 optimizer = transformers.Adafactor(params=model.parameters(), 
@@ -1306,7 +1275,7 @@ training_args = Seq2SeqTrainingArguments(
     remove_unused_columns=False,
     label_names=["labels"],
     gradient_checkpointing=True,
-    eval_on_start=True,
+    eval_on_start=False,
 )
 
 trainer = Seq2SeqTrainer(
@@ -1317,26 +1286,10 @@ trainer = Seq2SeqTrainer(
     data_collator=data_collator,
     compute_metrics=compute_metrics,
     tokenizer=feature_extractor,
-    callbacks=[metrics_callback]#, GradientClippingCallback]
+    callbacks=[metrics_callback]
 )    
 
 trainer.train(resume_from_checkpoint=False)
 
 model.save_pretrained(log_dir+"/models/echo4_trained/")
 import tensorboard
-
-
-# import torch
-# import numpy as np
-# import random
-
-# random.seed(42)
-# np.random.seed(42)
-# torch.manual_seed(42)
-# if torch.cuda.is_available():
-#     torch.cuda.manual_seed(42)
-#     torch.cuda.manual_seed_all(42)
-
-# trainer.evaluate()
-
-
