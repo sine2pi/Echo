@@ -544,14 +544,14 @@ class ResidualAttentionBlock(nn.Module):
 
     def forward(self, x, xa=None, mask=None, loss=None, kv_cache=None):
         if self.checkpointing:
-            x = checkpoint(self._attn_forward, x, mask, loss)
+            x = checkpoint(self._attn_forward, x, mask, loss, kv_cache)
         else:
-            x = self._attn_forward(x, mask, loss, kv_cache=None)
+            x = self._attn_forward(x, mask, loss, kv_cache)
         if self.cross_attn:
             if self.checkpointing:
-                x = checkpoint(self._cross_attn_forward, x, xa, kv_cache=None)
+                x = checkpoint(self._cross_attn_forward, x, xa, kv_cache)
             else:
-                x = self._cross_attn_forward(x, xa, kv_cache=None)
+                x = self._cross_attn_forward(x, xa, kv_cache)
         if self.checkpointing:
             x = checkpoint(self._mlp_forward, x)
         else:
