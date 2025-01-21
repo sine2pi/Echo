@@ -13,7 +13,7 @@ dataset used: https://huggingface.co/datasets/fixie-ai/librispeech_asr
 
 <img width="850" alt="eval" src="https://github.com/user-attachments/assets/3c165fdb-c12a-4d8f-8189-515927b00be8" />
 
-
+https://huggingface.co/Sin2pi/Echo2
 
 # Pilot run
 Both models were initialized from scratch and trained on the same data using a simple training setup outlined in modelA_with_trainer.ipynb. Hugging face trainer and datasets were used for consistency and reproducibility.  A lot more testing needs to be done but it looks promising 🙂. 
