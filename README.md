@@ -9,7 +9,7 @@ https://github.com/sine2pi/smart-sinusoid
 https://colab.research.google.com/drive/1XW6DG-7c9bqhETnmgz29r_-S5Wcjw6uQ?usp=sharing
 
 # Pilot run
-Both models were initialized from scratch and trained on the same data using a simple training setup outlined in modelA_with_trainer.ipynb. Hugging face trainer and datasets were used to keep things consistent and reproducable. A lot more testing needs to be done.
+Both models were initialized from scratch and trained on the same data using a simple training setup outlined in modelA_with_trainer.ipynb. Hugging face trainer and datasets were used for consistency and reproducibility.  A lot more testing needs to be done but it looks promising 🙂. 
 Both models can be considered "medium". 
 
     #Openai config :
