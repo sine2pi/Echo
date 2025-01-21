@@ -8,7 +8,8 @@ https://github.com/sine2pi/smart-sinusoid
 
 https://colab.research.google.com/drive/1XW6DG-7c9bqhETnmgz29r_-S5Wcjw6uQ?usp=sharing
 
-# Pilot study
+# Pilot run
+Both models initialized from scratch and trained on the same data with the same training setup in modelA_with_trainer.ipynb on the same computer with the same software/hardware. Hugging face trainer and datasets were used to keep things consistent and reproducable. A lot more testing needs to be done.
 
 ##  Echo
 ### Evaluation: - Step 1000 - Loss: 2.7929 - WER - 41.200828 - 
@@ -30,7 +31,7 @@ to!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
 
-### Metrics for an Echo model (medium) from scratch (no fine-tuning) over 1000 steps of training :
+### Metrics for an Echo model (medium) from scratch (not pretrained) over 1000 steps of training :
 
 <table>
 </div>
@@ -267,7 +268,7 @@ to!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
 
-### Metrics for an Openai whisper model (medium) from scratch (no fine-tuning) over 1000 steps of training :
+### Metrics for an Openai whisper model (medium) from scratch (not pretrained) over 1000 steps of training :
 
 <table>
 </div>
