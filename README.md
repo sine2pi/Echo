@@ -839,3 +839,6 @@ to!!!!!!!!!!!!!!!!!!!!!!!!!!!
   </tbody>
 </table><p>
 
+
+But the coolest part is that my logits schematic kinda looks like arms pointing at each other on its side.
+![logits_schematic2](https://github.com/user-attachments/assets/0c817af3-5967-4465-b086-4109e725e6c4)
