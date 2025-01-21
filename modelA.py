@@ -259,7 +259,7 @@ class ResidualAttentionBlock(nn.Module):
         )
         self.mlp_ln = nn.LayerNorm(n_state)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, xa: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = x + self.attn(self.attn_ln(x), mask=mask)[0]
         x = x + self.mlp(self.mlp_ln(x))
         return x
