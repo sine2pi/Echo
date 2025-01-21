@@ -1,5 +1,24 @@
-### Metrics for an Echo model (medium) from scratch 
-### (no fine-tuning) over 1000 steps of training :
+# Pilot study
+
+##  Echo
+### Evaluation: - Step 1000 - Loss: 2.7929 - WER - 41.200828
+##### Prediction:  his all hopes from back who may I will never see serious again unless I nor with me the not so words we will said of us turn back cried his hopes and its not added!!!!!!!!!!!!!!!!!!!!!!!!!!!
+##### Label: At all events turn back who may I will never see Greece again unless I carry with me the Golden Fleece we will none of us turn back cried his nine and forty brave comrades
+
+------
+
+
+## Whisper
+### Evaluation: - Step 1000 - Loss: 28.3524 - WER - 78.379178
+##### Prediction: And the all events the to who may had will the the the to to I the a me other to to to to we will to the us to to to his to the to to 
+to!!!!!!!!!!!!!!!!!!!!!!!!!!!
+##### Label: At all events turn back who may I will never see Greece again unless I carry with me the Golden Fleece we will none of us turn back cried his nine and forty brave comrades
+
+------
+
+
+
+### Metrics for an Echo model (medium) from scratch ### (no fine-tuning) over 1000 steps of training :
 
 <table>
 </div>
@@ -236,8 +255,7 @@
 
 
 
-### Metrics for an Openai whisper model (medium) from scratch 
-### (no fine-tuning) over 1000 steps of training :
+### Metrics for an Openai whisper model (medium) from scratch (no fine-tuning) over 1000 steps of training :
 
 <table>
 </div>
