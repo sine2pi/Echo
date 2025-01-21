@@ -1,7 +1,9 @@
 # Pilot study
 
 ##  Echo
-### Evaluation: - Step 1000 - Loss: 2.7929 - WER - 41.200828
+### Evaluation: - Step 1000 - Loss: 2.7929 - WER - 41.200828 - 
+20% fewer layers
+
 ##### Prediction:  his all hopes from back who may I will never see serious again unless I nor with me the not so words we will said of us turn back cried his hopes and its not added!!!!!!!!!!!!!!!!!!!!!!!!!!!
 ##### Label: At all events turn back who may I will never see Greece again unless I carry with me the Golden Fleece we will none of us turn back cried his nine and forty brave comrades
 
@@ -18,7 +20,7 @@ to!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
 
-### Metrics for an Echo model (medium) from scratch ### (no fine-tuning) over 1000 steps of training :
+### Metrics for an Echo model (medium) from scratch (no fine-tuning) over 1000 steps of training :
 
 <table>
 </div>
