@@ -12,45 +12,45 @@ https://colab.research.google.com/drive/1XW6DG-7c9bqhETnmgz29r_-S5Wcjw6uQ?usp=sh
 Both models were initialized from scratch and trained on the same data using a simple training setup outlined in modelA_with_trainer.ipynb. Hugging face trainer and datasets were used to keep things consistent and reproducable. A lot more testing needs to be done.
 Both models can be considered "medium". 
 
-Openai config :
-dims = ModelDimensions(
-    bos_token_id=50257,
-    decoder_start_token_id=50258,
-    eos_token_id=50257,
-    init_std=0.02,
-    n_audio_ctx=1500,
-    n_audio_head=16,
-    n_audio_layer=24,
-    n_audio_state=1024,
-    n_mels=128,
-    n_text_ctx=448,
-    n_text_head=16,
-    n_text_layer=16,
-    n_text_state=1024,
-    pad_token_id=50257,
-    n_vocab=51865,
-)
-
-Echo config :
-config = EchoConfig(
-    base=10000,
-    bos_token_id=50257,
-    decoder_start_token_id=50258,
-    eos_token_id=50257,
-    init_std=0.02,
-    max_dist=128,
-    n_audio_ctx=1500,
-    n_audio_head=16,
-    n_audio_layer=20, 
-    n_audio_state=1024,
-    n_mels=128,
-    n_text_ctx=448,
-    n_text_head=16,
-    n_text_layer=16,
-    n_text_state=1024,
-    pad_token_id=50257,
-    n_vocab=51865,
+    #Openai config :
+    dims = ModelDimensions(
+        bos_token_id=50257,
+        decoder_start_token_id=50258,
+        eos_token_id=50257,
+        init_std=0.02,
+        n_audio_ctx=1500,
+        n_audio_head=16,
+        n_audio_layer=24,
+        n_audio_state=1024,
+        n_mels=128,
+        n_text_ctx=448,
+        n_text_head=16,
+        n_text_layer=16,
+        n_text_state=1024,
+        pad_token_id=50257,
+        n_vocab=51865,
     )
+
+    #Echo config :
+    config = EchoConfig(
+        base=10000,
+        bos_token_id=50257,
+        decoder_start_token_id=50258,
+        eos_token_id=50257,
+        init_std=0.02,
+        max_dist=128,
+        n_audio_ctx=1500,
+        n_audio_head=16,
+        n_audio_layer=20, 
+        n_audio_state=1024,
+        n_mels=128,
+        n_text_ctx=448,
+        n_text_head=16,
+        n_text_layer=16,
+        n_text_state=1024,
+        pad_token_id=50257,
+        n_vocab=51865,
+        )
 
 ##  Echo
 ### Evaluation: - Step 1000 - Loss: 2.7929 - WER - 41.200828 - 
