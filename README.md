@@ -1,3 +1,11 @@
+This model does not include the focused attention blocks. It includes the givens orthogonal rotary for the encoder, dynamic relative positional bias and dynamic base frequency that internally update based on loss, custom multihead, and learned sinusoidal for the decoder.
+
+https://github.com/sine2pi/givens-orthogonal-embeddings
+
+https://github.com/sine2pi/big-multihead-attention
+
+https://github.com/sine2pi/smart-sinusoid
+
 # Pilot study
 
 ##  Echo
