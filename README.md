@@ -60,9 +60,9 @@ Both models can be considered "medium".
         )
 
 ##  Echo
-### Evaluation: - Step 1000 - Loss: 2.7929 - WER - 41.200828 - 
-
-##### Prediction:  his all hopes from back who may I will never see serious again unless I nor with me the not so words we will said of us turn back cried his hopes and its not added!!!!!!!!!!!!!!!!!!!!!!!!!!!
+### Evaluation: - Step 1000 - Loss: 2.7929 - WER - 41.200828 
+step-1000
+##### Last Prediction:  his all hopes from back who may I will never see serious again unless I nor with me the not so words we will said of us turn back cried his hopes and its not added!!!!!!!!!!!!!!!!!!!!!!!!!!!
 ##### Label: At all events turn back who may I will never see Greece again unless I carry with me the Golden Fleece we will none of us turn back cried his nine and forty brave comrades
 
 ------
@@ -70,7 +70,8 @@ Both models can be considered "medium".
 
 ## Whisper
 ### Evaluation: - Step 1000 - Loss: 28.3524 - WER - 78.379178
-##### Prediction: And the all events the to who may had will the the the to to I the a me other to to to to we will to the us to to to his to the to to 
+step-1000
+##### Last Prediction: And the all events the to who may had will the the the to to I the a me other to to to to we will to the us to to to his to the to to 
 to!!!!!!!!!!!!!!!!!!!!!!!!!!!
 ##### Label: At all events turn back who may I will never see Greece again unless I carry with me the Golden Fleece we will none of us turn back cried his nine and forty brave comrades
 
