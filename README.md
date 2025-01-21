@@ -8,6 +8,13 @@ https://github.com/sine2pi/smart-sinusoid
 
 https://colab.research.google.com/drive/1XW6DG-7c9bqhETnmgz29r_-S5Wcjw6uQ?usp=sharing
 
+dataset used: https://huggingface.co/datasets/fixie-ai/librispeech_asr
+
+
+<img width="850" alt="eval" src="https://github.com/user-attachments/assets/3c165fdb-c12a-4d8f-8189-515927b00be8" />
+
+
+
 # Pilot run
 Both models were initialized from scratch and trained on the same data using a simple training setup outlined in modelA_with_trainer.ipynb. Hugging face trainer and datasets were used for consistency and reproducibility.  A lot more testing needs to be done but it looks promising 🙂. 
 Both models can be considered "medium". 
@@ -54,7 +61,6 @@ Both models can be considered "medium".
 
 ##  Echo
 ### Evaluation: - Step 1000 - Loss: 2.7929 - WER - 41.200828 - 
-20% fewer layers
 
 ##### Prediction:  his all hopes from back who may I will never see serious again unless I nor with me the not so words we will said of us turn back cried his hopes and its not added!!!!!!!!!!!!!!!!!!!!!!!!!!!
 ##### Label: At all events turn back who may I will never see Greece again unless I carry with me the Golden Fleece we will none of us turn back cried his nine and forty brave comrades
