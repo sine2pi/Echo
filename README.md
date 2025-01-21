@@ -6,6 +6,8 @@ https://github.com/sine2pi/big-multihead-attention
 
 https://github.com/sine2pi/smart-sinusoid
 
+https://colab.research.google.com/drive/1XW6DG-7c9bqhETnmgz29r_-S5Wcjw6uQ?usp=sharing
+
 # Pilot study
 
 ##  Echo
