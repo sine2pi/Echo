@@ -1,844 +1,990 @@
-This model does not include the focused attention blocks. It includes the givens orthogonal rotary for the encoder, dynamic relative positional bias and dynamic base frequency that internally update based on loss, custom multihead, and learned sinusoidal for the decoder.
-
-https://github.com/sine2pi/givens-orthogonal-embeddings
-
-https://github.com/sine2pi/big-multihead-attention
-
-https://github.com/sine2pi/smart-sinusoid
-
-https://colab.research.google.com/drive/1XW6DG-7c9bqhETnmgz29r_-S5Wcjw6uQ?usp=sharing
-
-dataset used: https://huggingface.co/datasets/fixie-ai/librispeech_asr
-
-
-<img width="850" alt="eval" src="https://github.com/user-attachments/assets/3c165fdb-c12a-4d8f-8189-515927b00be8" />
-
-https://huggingface.co/Sin2pi/Echo2
-
-# Pilot run
-Both models were initialized from scratch and trained on the same data using a simple training setup outlined in modelA_with_trainer.ipynb. Hugging face trainer and datasets were used for consistency and reproducibility.  A lot more testing needs to be done but it looks promising 🙂. 
-Both models can be considered "medium". 
-
-    #Openai config :
-    dims = ModelDimensions(
-        bos_token_id=50257,
-        decoder_start_token_id=50258,
-        eos_token_id=50257,
-        init_std=0.02,
-        n_audio_ctx=1500,
-        n_audio_head=16,
-        n_audio_layer=24,
-        n_audio_state=1024,
-        n_mels=128,
-        n_text_ctx=448,
-        n_text_head=16,
-        n_text_layer=16,
-        n_text_state=1024,
-        pad_token_id=50257,
-        n_vocab=51865,
+    
+    
+    import base64, json
+    import gzip
+    import math
+    import os
+    import functools
+    import warnings
+    import numpy as np
+    import torch
+    import transformers
+    import aiohttp
+    import torch.nn.functional as F
+    from torch import Tensor, amp, optim, nn
+    from torch.utils.checkpoint import checkpoint
+    from torch.utils.tensorboard.writer import SummaryWriter
+    from threading import Thread
+    from typing import Dict, Optional, Tuple, Union, List, Any, Iterable
+    from transformers.modeling_utils import PreTrainedModel
+    from dataclasses import dataclass
+    from transformers import (
+        Seq2SeqTrainer, Seq2SeqTrainingArguments, PretrainedConfig, TrainerCallback,
+        WhisperProcessor, WhisperFeatureExtractor, WhisperTokenizerFast, WhisperTokenizer
     )
-
-    #Echo config :
+    from torch.nn.functional import scaled_dot_product_attention
+    import evaluate
+    from evaluate import module
+    from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
+    from sklearn.model_selection import KFold, train_test_split
+    from datasets import load_dataset, Dataset, concatenate_datasets, IterableDatasetDict, Audio
+    # from torch.nn.functional import scaled_dot_product_attention
+    
+    import warnings
+    transformers.utils.logging.set_verbosity_error()
+    warnings.filterwarnings(action="ignore")
+    warnings.warn=lambda *args, **kwargs: None
+    device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    dtype=torch.float32
+    dd=(dtype, device)
+    torch.set_default_dtype(dtype)
+    
+    
+    
+    class CustomEmbedding(nn.Module):
+        def __init__(self, initial_value, learnable=True):
+            super(CustomEmbedding, self).__init__()
+            if learnable:
+                self.value=nn.Parameter(torch.tensor(initial_value))
+            else:
+                self.register_buffer('value', torch.tensor(initial_value))
+        def forward(self):
+            return self.value
+    
+    class Linear(nn.Linear):
+        def forward(self, x: Tensor) -> Tensor: # type: ignore
+            return F.linear(
+                x,
+                self.weight.to(x.dtype),
+                None if self.bias is None else self.bias.to(x.dtype),
+            )
+    
+    class Conv1d(nn.Conv1d):
+        def _conv_forward( # type: ignore
+            self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
+        ) -> Tensor:
+            return super()._conv_forward(
+                x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+            )
+    
+    class LayerNorm(nn.LayerNorm):
+        def forward(self, x: Tensor) -> Tensor: # type: ignore
+            return super().forward(x.float()).type(x.dtype)
+    
+    
+    class CombinedRotaryEmbedding(nn.Module):
+        def __init__(self, n_state: int, n_head: int, n_freq: float,
+                     theta_scale_learnable: bool = True,
+                     n_rots_scale_learnable: bool = True,
+                     r_matrix_learnable: bool = False,
+                     inv_freq_learnable: bool = True):
+            super().__init__()
+            self.n_state = n_state
+            self.n_head = n_head
+            self.n_freq = n_freq
+            assert self.n_state % self.n_head == 0, "n_state must be divisible by n_head"
+            self.h_dim = self.n_state // self.n_head
+            assert self.h_dim % 2 == 0, "Head dimension must be even for rotary embeddings"
+            self.n_rots = ((n_state // n_head) // 2)
+    
+            # --- Learnable Parameters ---
+            self.thetas = nn.Parameter(torch.zeros(self.n_rots))
+            self.r_pairs = nn.Parameter(data=torch.rand(self.n_rots, 2) * self.h_dim)
+    
+            # --- Scaling Parameters ---
+            self.theta_scale = nn.Parameter(torch.ones(1), requires_grad=theta_scale_learnable)
+            self.n_rots_scale = nn.Parameter(torch.ones(1), requires_grad=n_rots_scale_learnable)
+    
+            # --- R Matrix ---
+            self.r_matrix = nn.Parameter(torch.eye(n=self.h_dim), requires_grad=r_matrix_learnable)
+    
+            # --- Frequency Parameters for RoPE ---
+            inv_freq_data = 1.0 / (self.n_freq ** (torch.arange(start=0, end=self.h_dim, step=2).float() / self.h_dim))
+            self.inv_freq = nn.Parameter(inv_freq_data, requires_grad=inv_freq_learnable)
+    
+            # --- Regularization ---
+            self.orthogonal_reg_weight = 0.01  
+    
+        def givens_r_matrix(self, n_state, i, j, theta):
+            G = torch.eye(n_state).to(theta.device)
+            G[i, i] = math.cos(theta)
+            G[i, j] = -math.sin(theta)
+            G[j, i] = math.sin(theta)
+            G[j, j] = math.cos(theta)
+            return G
+    
+        def update_base(self, new_base):
+            if new_base is not None and new_base != self.n_freq:
+                self.n_freq = new_base
+                inv_freq = 1.0 / (self.n_freq ** (torch.arange(start=0, end=self.h_dim, step=2).float() / self.h_dim))
+                self.inv_freq.data.copy_(inv_freq)
+    
+        def reset_parameters(self):
+            nn.init.orthogonal_(tensor=self.r_matrix)
+            nn.init.zeros_(tensor=self.thetas)
+    
+        def orthogonal_regularization_term(self):
+            """Calculates the orthogonal regularization term for r_matrix."""
+            loss = torch.tensor(0.0, device=self.r_matrix.device) 
+            if self.r_matrix.requires_grad: 
+                product = torch.matmul(self.r_matrix, self.r_matrix.t())
+                identity = torch.eye(self.r_matrix.size(0)).to(self.r_matrix.device)
+                loss = ((product - identity) ** 2).sum()
+            return self.orthogonal_reg_weight * loss
+    
+        def forward(self, x):
+            if x.dim() not in [3, 4]:
+                raise ValueError(f"Expected input tensor to be 3D or 4D, but got {x.dim()}D")
+    
+            batch_size, seq_len, *rest = x.size()
+    
+            if x.dim() == 3:
+                n_state = rest[0]
+                if n_state != self.n_head * self.h_dim:
+                    raise ValueError(
+                        f"Expected n_state ({n_state}) to be compatible with n_head ({self.n_head}) * h_dim ({self.h_dim}={self.n_head * self.h_dim})")
+            else:
+                n_head, h_dim = rest
+                if n_head != self.n_head or h_dim != self.h_dim:
+                    raise ValueError(
+                        f"For 4D input, expected n_head {self.n_head} and h_dim {self.h_dim}, but got n_head {n_head} and h_dim {h_dim}")
+    
+            x = x.view(batch_size, seq_len, self.n_head, self.h_dim)
+            x = x.reshape(-1, self.h_dim)
+            adjusted_n_rots = int(torch.round(self.n_rots_scale * self.n_rots))
+    
+            for k in range(adjusted_n_rots):
+                i, j = self.r_pairs[k].long()
+                theta = self.thetas[k] * self.theta_scale
+                G = self.givens_r_matrix(n_state=self.h_dim, i=i, j=j, theta=theta)
+                x = torch.matmul(input=x, other=G)
+    
+            x = torch.matmul(input=x, other=self.r_matrix)
+            x = x.view(batch_size, seq_len, self.n_head, self.h_dim)
+    
+            sinusoid_inp = torch.einsum('i, j -> i j', torch.arange(end=seq_len, device=x.device),
+                                         self.inv_freq.to(device=x.device))
+            sin = sinusoid_inp.sin()[None, :, None, :]
+            cos = sinusoid_inp.cos()[None, :, None, :]
+    
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            x = torch.cat(tensors=[x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+            x = x.view(batch_size, seq_len, self.n_state)
+    
+            return x
+    #     loss += embedding_layer.orthogonal_regularization_term()
+    
+    class LearnedSinusoidalEmbeddings(nn.Module):
+        def __init__(self, n_ctx: int, n_state: int):
+            super().__init__()
+    
+            position=torch.arange(start=0, end=n_ctx, dtype=dtype).unsqueeze(dim=1)
+            div_term=torch.exp(input=torch.arange(start=0, end=n_state, step=2, dtype=dtype) * -(math.log(10000.0) / n_state))
+            features=torch.zeros(n_ctx, n_state)
+            features[:, 0::2]=torch.sin(position * div_term)
+            features[:, 1::2]=torch.cos(position* div_term)
+            self.register_buffer('my_big_toe', features)
+            self.positional_embeddings=nn.Parameter(self.my_big_toe.clone())
+    
+        def forward(self, positions):
+            position_embeddings=self.positional_embeddings[positions]
+            position_embeddings=torch.nn.functional.normalize(position_embeddings, p=2, dim=-1)
+            return position_embeddings
+    
+    
+    class MultiheadAttention(nn.Module):
+        use_sdpa = True
+        def __init__(self, n_state, n_head, n_dist, n_freq):
+            super().__init__()
+            self.n_state = n_state
+            self.n_head = n_head
+            self.n_dist = n_dist
+            assert self.n_state % self.n_head == 0, "n_state must be divisible by n_head"
+            self.h_dim = self.n_state // self.n_head
+            assert self.h_dim % 2 == 0, "Head dimension must be even for rotary embeddings"
+            self.givens_rotary=CombinedRotaryEmbedding(n_state, n_head, n_freq)
+            self.query = nn.Linear(self.n_state, self.n_state)
+            self.key = nn.Linear(self.n_state, self.n_state, bias=False)
+            self.value = nn.Linear(self.n_state, self.n_state)
+            self.out = nn.Linear(self.n_state, self.n_state)
+            
+            self.kv_cache = {}
+                               
+        def forward(self, x, xa = None,  mask = None, kv_cache = None, r_bias=None):
+    
+            q = self.query(x)
+    
+            if kv_cache is None or xa is None or self.key not in kv_cache:
+                k = self.key(x if xa is None else xa)
+                v = self.value(x if xa is None else xa)
+            else:
+    
+                k = kv_cache[self.key]
+                v = kv_cache[self.value]
+                
+            q = self.givens_rotary(q)# * self.positional_scaling
+            k = self.givens_rotary(k)# * self.positional_scaling
+    
+            wv, qk = self.qkv_attention(q, k, v, mask)
+            return self.out(wv), qk
+       
+        def qkv_attention(
+            self, q: Tensor, k: Tensor, v: Tensor, mask):
+            
+            n_batch, n_ctx, n_state = q.shape
+            scale = (n_state // self.n_head) ** -0.25
+            q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+            k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+            v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+    
+    
+            if MultiheadAttention.use_sdpa:
+                a = scaled_dot_product_attention(q, k, v, is_causal=mask is not None and n_ctx > 1 )
+    
+                out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+                qk = None
+            else:
+                qk = (q * scale) @ (k * scale).transpose(-1, -2)
+                if mask is not None:
+                    qk = qk + mask[:n_ctx, :n_ctx]
+                qk = qk.float()
+    
+                w = F.softmax(qk, dim=-1).to(q.dtype)
+                out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
+                qk = qk.detach()
+    
+            return out, qk
+        
+    
+    # class RelativePositionalBias(nn.Module):
+    #     def __init__(self, max_dist: int, n_head: int):
+    #         super().__init__()
+    #         self.max_dist = max_dist
+    #         self.n_head = n_head
+    #         self.pos_bias = nn.Parameter(torch.zeros((2 * int(self.max_dist) - 1, self.n_head)))
+    
+    #     def forward(self, seq_len_q, seq_len_k, device):
+    #         positions = torch.arange(end=seq_len_q, device=device).unsqueeze(dim=1) - torch.arange(end=seq_len_k, device=device).unsqueeze(dim=0)
+    #         positions = positions.clamp(min=-self.max_dist + 1, max=self.max_dist - 1) + self.max_dist - 1
+    #         rel_bias = self.pos_bias[positions]
+    #         rel_bias = rel_bias.permute(2, 0, 1).unsqueeze(0)  # (1, n_head, seq_len_q, seq_len_k)
+    #         return rel_bias
+    
+    #     def update_dist(self, new_dist, device):
+    #         if new_dist is not None and new_dist != self.max_dist:
+    #             self.max_dist = new_dist
+    #             self.pos_bias = nn.Parameter(torch.zeros((2 * int(self.max_dist) - 1, self.n_head))).to(device)
+    
+    # class MultiheadAttention(nn.Module):
+    #     use_sdpa = True
+    
+    #     def __init__(self, n_state: int, n_head: int, n_freq: int):
+    #         super().__init__()
+    #         self.n_state = n_state
+    #         self.n_head = n_head
+    
+    #         assert self.n_state % self.n_head == 0, "n_state must be divisible by n_head"
+    #         self.h_dim = self.n_state // self.n_head
+    #         assert self.h_dim % 2 == 0, "Head dimension must be even for rotary embeddings"
+    
+    #         self.query = nn.Linear(self.n_state, self.n_state)
+    #         self.key = nn.Linear(self.n_state, self.n_state, bias=False)
+    #         self.value = nn.Linear(self.n_state, self.n_state)
+    #         self.out = nn.Linear(self.n_state, self.n_state)
+    #         self.givens_rotary = CombinedRotaryEmbedding(n_state, n_head, n_freq)
+    #         self.kv_cache = {}
+    
+    #         self.positional_scaling = nn.Parameter(torch.ones(1))
+    
+    #     def forward(self, x: Tensor, xa: Optional[Tensor] = None,
+    #                 mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None,
+    #                 rel_pos_bias: Optional[Tensor] = None) -> tuple[Any, Tensor | None]:
+    
+    #         q = self.query(x)
+    
+    #         if kv_cache is None or xa is None or self.key not in kv_cache:
+    #             k = self.key(x if xa is None else xa)
+    #             v = self.value(x if xa is None else xa)
+    #         else:
+    #             k = kv_cache[self.key]
+    #             v = kv_cache[self.value]
+    
+    #         q = self.givens_rotary(q)
+    #         k = self.givens_rotary(k)
+            
+    #         wv, qk = self.qkv_attention(q, k, v, mask, rel_pos_bias)
+    #         return self.out(wv), qk
+    
+    #     def qkv_attention(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None,
+    #                       rel_pos_bias: Optional[Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    #         n_batch, n_ctx, n_state = q.shape
+    #         scale = (n_state // self.n_head) ** -0.25
+    #         q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+    #         k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+    #         v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+    
+    #         attn_scores = torch.matmul(q, k.transpose(-2, -1))
+    
+    #         if rel_pos_bias is not None:
+    #             attn_scores = attn_scores + rel_pos_bias
+    
+    #         attn_scores = attn_scores * scale
+    
+    #         if MultiheadAttention.use_sdpa:
+    #             a = scaled_dot_product_attention(q, k, v, attn_mask=attn_scores, is_causal=mask is not None and n_ctx > 1)
+    #             out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+    #             qk = None
+    #         else:
+    #             qk = (q * scale) @ (k * scale).transpose(-1, -2) # moved the scaling here
+    #             if mask is not None:
+    #                 qk = qk + mask[:n_ctx, :n_ctx]
+    #             qk = qk.float()
+    
+    #             w = F.softmax(qk, dim=-1).to(q.dtype)
+    #             out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
+    #             qk = qk.detach()
+    
+    #         return out, qk
+    
+    
+    class ResidualAttentionBlock(nn.Module):
+    
+        def __init__(self, n_state, n_head, n_dist, n_freq):
+            super().__init__()
+    
+            self.attn=MultiheadAttention(n_state, n_head, n_dist, n_freq)
+            self.attn_ln=nn.LayerNorm(n_state)
+            
+            n_mlp=n_state * 4
+            self.mlp=nn.Sequential(
+                nn.Linear(n_state, n_mlp), nn.GELU(), nn.Linear(n_mlp, n_state)
+            )
+            self.mlp_ln=nn.LayerNorm(n_state)
+    
+        def forward(
+            self,
+            x: Tensor,
+            xa: Optional[Tensor] = None,
+            mask: Optional[Tensor] = None,
+            kv_cache: Optional[dict] = None,
+    
+        ):
+            x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+    
+            x = x + self.mlp(self.mlp_ln(x))
+            return x
+    
+    
+    class AudioEncoder(nn.Module):
+        def __init__(self, n_mels, n_ctx, n_state, n_head, n_layer, n_dist, n_freq, hybrid_attn, cross_attn) -> None:
+            super().__init__()
+            self.n_head = n_head
+            self.h_dim = n_state // n_head
+            self.conv1 = nn.Conv1d(n_mels, n_state, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
+            self.n_state = n_state
+    
+            self.givens_rotary = CombinedRotaryEmbedding(n_state, n_head, n_freq)
+    
+            self.blocks = nn.ModuleList([
+                ResidualAttentionBlock(n_state, n_head, n_dist, n_freq)
+                for _ in range(n_layer)
+            ])
+            self.ln_post = nn.LayerNorm(n_state)
+    
+    
+        def forward(self, x):
+            x = F.gelu(self.conv1(x))
+            x = F.gelu(self.conv2(x))
+            x = x.permute(0, 2, 1)
+            x = self.givens_rotary(x)
+            x = x.to(x.dtype)
+    
+            for block in self.blocks:
+                x = block(x)
+            x = self.ln_post(x)
+    
+            return x
+    
+    class TextDecoder(nn.Module):
+        def __init__(self, n_vocab, n_ctx, n_state, n_head, n_layer, n_dist, n_freq, hybrid_attn, cross_attn):
+            super().__init__()
+    
+            self.sin_embedding = LearnedSinusoidalEmbeddings(n_ctx, n_state)
+            self.token_embedding = nn.Embedding(n_vocab, n_state)
+            self.positional_embedding = nn.Parameter(torch.empty(n_ctx, n_state))
+            nn.init.normal_(self.positional_embedding, mean=0.0, std=0.02)
+    
+            self.blocks = nn.ModuleList([
+                ResidualAttentionBlock(n_state, n_head, n_dist, n_freq)
+                for _ in range(n_layer)
+            ])
+            self.ln = nn.LayerNorm(n_state)
+    
+            mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
+            self.register_buffer("mask", mask, persistent=False)
+    
+        def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+            offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
+            x = (self.token_embedding(x) + self.positional_embedding[offset : offset + x.shape[-1]])
+            x = x.to(xa.dtype)
+    
+            for block in self.blocks:
+                x = block(x, xa, mask=self.mask)
+    
+            x = self.ln(x)
+            logits = (
+                x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
+            ).float()
+    
+            return logits
+    
+    
+    class EchoConfig(PretrainedConfig):
+           
+        def __init__(
+            self,
+            n_mels=80,
+            n_audio_ctx=1500,
+            n_audio_head=16,
+            n_audio_layer=24,
+            n_audio_state=1024,
+            n_vocab=51865,
+            n_text_ctx=448,
+            n_text_head=16,
+            n_text_layer=16,
+            n_text_state=1024,
+            n_dist=128,
+            n_freq=10000,
+            hybrid_attn=False,
+            cross_attn=False,
+            bos_token_id=50257,
+            eos_token_id=50257,
+            pad_token_id=50257,
+            decoder_start_token_id=50258,       
+            **kwargs,
+            
+        ):
+            super(EchoConfig, self).__init__(**kwargs)
+            self.n_mels = n_mels
+            self.n_audio_ctx = n_audio_ctx
+            self.n_audio_head = n_audio_head
+            self.n_audio_layer = n_audio_layer
+            self.n_audio_state = n_audio_state
+            self.n_vocab = n_vocab
+            self.n_text_ctx = n_text_ctx
+            self.n_text_head = n_text_head
+            self.n_text_layer = n_text_layer
+            self.n_text_state = n_text_state
+            self.n_dist = n_dist
+            self.n_freq = n_freq
+            self.cross_attn = cross_attn
+            self.hybrid_attn = hybrid_attn
+            self.bos_token_id = bos_token_id
+            self.eos_token_id = eos_token_id
+            self.pad_token_id = pad_token_id
+            self.decoder_start_token_id = decoder_start_token_id
+    
+    
+    class Echo(PreTrainedModel):
+        config_class = EchoConfig
+        def __init__(self, config: EchoConfig):
+            super().__init__(config)
+            self.config = config
+            
+            self.encoder=AudioEncoder(
+                self.config.n_mels,
+                self.config.n_audio_ctx,
+                self.config.n_audio_state,
+                self.config.n_audio_head,
+                self.config.n_audio_layer,
+                self.config.n_dist,
+                self.config.n_freq,
+                self.config.hybrid_attn, 
+                self.config.cross_attn,
+            )
+    
+            self.decoder=TextDecoder(
+                self.config.n_vocab,
+                self.config.n_text_ctx,
+                self.config.n_text_state, 
+                self.config.n_text_head,
+                self.config.n_text_layer,
+                self.config.n_dist,
+                self.config.n_freq,
+                self.config.hybrid_attn, 
+                self.config.cross_attn,
+            )
+            
+            self.encoder.givens_rotary.reset_parameters()
+            
+            self.init_std=0.02
+            all_heads=torch.zeros(self.config.n_text_layer, self.config.n_text_head, dtype=torch.bool) 
+            all_heads[self.config.n_text_layer // 2:]=True 
+            self.register_buffer("alignment_heads", all_heads.to_sparse(), persistent=False)
+    
+            self.n_freq=self.config.n_freq
+            self.n_dist=self.config.n_dist
+            self.adjust_counter=0
+            self.best_loss=float('inf')
+            self.kv_cache={}
+       
+        def update_dist(self, new_dist):
+            self.new_dist=new_dist
+            for name, module in self.encoder.named_modules():
+                if isinstance(module, (MultiheadAttention)):
+                    module.update_dist(self.new_dist)
+    
+        def adjust_n_dist(self, loss, step_size=1, threshold=0.0005) -> int:
+            if self.adjust_counter % 25 == 0:
+                if loss < self.best_loss:
+                    potential_new_dist=self.n_dist + step_size
+                else:
+                    potential_new_dist=max(1, self.n_dist - step_size)            
+                if abs(potential_new_dist - self.n_dist) >= threshold:
+                    new_dist=potential_new_dist
+                    self.update_dist(new_dist)
+                    self.n_dist=new_dist
+                    self.best_loss=loss
+            self.adjust_counter += 1
+            return self.n_dist
+    
+        def adjust_base(self, loss, factor=1.0025):
+                    if self.adjust_counter % 25 == 0:
+                        if loss < self.best_loss:
+                            new_base=self.n_freq   * factor
+                        else:
+                            new_base=self.n_freq   / factor
+                        self.update_base(new_base)
+                        self.n_freq=new_base
+                        self.best_loss=loss
+                    self.adjust_counter += 1
+                    return self.n_freq
+                
+        def update_base(self, new_base):
+            self.new_base=new_base
+            for name, module in self.encoder.named_modules():
+                if isinstance(module, (CombinedRotaryEmbedding)):
+                    module.update_base(self.new_base)
+                
+        def print_update(self):
+            self.adjust_counter += 1
+            if self.adjust_counter % 25 == 0:
+                print(f"{self.adjust_counter}: Loss: {self.best_loss:.4f}  Base: {self.n_freq:.4f}, Distance: {self.n_dist}")
+                
+        @staticmethod
+        def shift_tokens_right(input_ids, pad_token_id, decoder_start_token_id):
+            shifted_input_ids=input_ids.new_zeros(input_ids.shape)
+            shifted_input_ids[:, 1:]=input_ids[:, :-1].clone() 
+            shifted_input_ids[:, 0]=decoder_start_token_id
+            shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
+            return shifted_input_ids
+    
+        def forward(self, input_features, labels=None, dec_input_ids=None):
+            if labels is not None:
+                if dec_input_ids is None:
+                    dec_input_ids=self.shift_tokens_right(
+                        labels, self.config.pad_token_id, self.config.decoder_start_token_id
+                    )
+    
+            encoded_features=self.encoder(input_features).to(device)  
+            logits=self.decoder(dec_input_ids, encoded_features)
+    
+            loss=None
+            if labels is not None:
+                loss_fct=nn.CrossEntropyLoss(ignore_index=-100)
+                labels=labels.to(logits.device).long()
+                loss=loss_fct(logits.view(-1, self.config.n_vocab), labels.view(-1))
+    
+                self.adjust_base(loss.item())
+                # self.print_update()
+                # self.adjust_n_dist(loss.item())
+    
+            return {"loss": loss, "logits": logits}
+    
+        def reset_parameters(self):
+            for name, module in self.encoder.named_modules():
+                if isinstance(module, CombinedRotaryEmbedding):
+                    module.reset_parameters()
+            self.encoder.apply(self._init_weights)
+            
+        def _initialize_weights(self, module):
+                nn.init.normal_(self.decoder.token_embedding.weight, mean=0.0, std=0.02)
+                if hasattr(self.decoder.positional_embedding, 'weight'):
+                    nn.init.normal_(self.decoder.positional_embedding, mean=0.0, std=0.02)
+                for block in self.decoder.blocks:
+                    for layer in block.children():
+                        if isinstance(layer, nn.Linear):
+                            nn.init.xavier_normal_(layer.weight)
+                            if layer.bias is not None:
+                                nn.init.zeros_(layer.bias)
+    
+                nn.init.constant_(self.decoder.ln.weight, 1)
+                if self.decoder.ln.bias is not None:
+                    nn.init.constant_(self.decoder.ln.bias, 0)
+    
+                nn.init.xavier_normal_(self.encoder.conv1.weight)
+                if self.encoder.conv1.bias is not None:
+                    nn.init.zeros_(self.encoder.conv1.bias)
+    
+                nn.init.kaiming_normal_(self.encoder.conv2.weight, mode='fan_out', nonlinearity='relu')
+                if self.encoder.conv2.bias is not None:
+                    nn.init.zeros_(self.encoder.conv2.bias)
+    
+                nn.init.constant_(self.encoder.ln_post.weight, 1)
+                if self.encoder.ln_post.bias is not None:
+                    nn.init.constant_(self.encoder.ln_post.bias, 0)
+    
+        def apply_initialization(self, module):
+            self._initialize_weights(module)
+    
+        def set_alignment_heads(self, dump: bytes):
+            array=np.frombuffer(
+                gzip.decompress(base64.b85decode(dump)), dtype=bool
+            ).copy()
+            mask=torch.from_numpy(array).reshape(
+                self.config.n_text_layer, self.config.n_text_head
+            )
+            self.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
+    
+        def embed_audio(self, mel):
+            return self.encoder(mel)
+    
+        def logits(self, labels, input_features):
+            return self.decoder(labels, input_features)
+    
+        @property
+        def device(self):
+            return next(self.parameters()).device
+    
+        @property
+        def supports_gradient_checkpointing(self):
+            return True
+    
+        def install_kv_cache_hooks(self, cache=None):
+            cache={**cache} if cache is not None else {}
+            hooks=[]
+    
+            def save_to_cache(module, _, output):
+                if module not in cache or output.shape[1] > self.config.n_text_ctx:
+                    cache[module]=output
+                else:
+                    cache[module]=torch.cat([cache[module], output], dim=1).detach()
+                return cache[module]
+    
+            def install_hooks(layer: nn.Module):
+                if isinstance(layer, MultiheadAttention):
+                    hooks.append(layer.key.register_forward_hook(save_to_cache))
+                    hooks.append(layer.value.register_forward_hook(save_to_cache))
+    
+            self.decoder.apply(install_hooks)
+            return cache, hooks
+    
+        def prepare_inputs_for_generation(self, input_features, **kwargs):
+            return {'input_features': input_features}
+    
+        def _prepare_decoder_input_ids_for_generation(self, batch_size, decoder_start_token_id=None, bos_token_id=None):
+            return torch.ones((batch_size, 1), dtype=torch.long, device=self.device) * self.config.decoder_start_token_id
+    
+        def can_generate(self):
+            return True
+            
+        def generate(self, input_features, max_length=32, num_samples=None, **kwargs):
+            if num_samples is not None:
+                input_features = input_features[:num_samples]
+    
+            encoder_outputs = self.encoder(input_features)
+            decoder_input_ids = torch.ones((input_features.size(0), 1), dtype=torch.long, 
+                                        device=input_features.device) * self.config.decoder_start_token_id   
+            generated_sequences = decoder_input_ids
+            
+            for step in range(max_length - 1):
+                outputs = self.decoder(generated_sequences, encoder_outputs)
+                next_token_logits = outputs[:, -1, :]
+                next_token_id = next_token_logits.argmax(dim=-1, keepdim=True)
+                
+                generated_sequences = torch.cat([generated_sequences, next_token_id], dim=-1)
+                # if step % 1 == 0:
+                #     print(f"Step {step+1}: Generated {generated_sequences.size(1)} tokens so far.")
+            #     if torch.all(next_token_id == self.config.eos_token_id):
+            #         break
+            # print("Generation complete!")
+            return generated_sequences
+    
+        def generate_beam_search(self, input_features, num_beams=1, max_length=32, **kwargs):
+            encoder_outputs = self.encoder(input_features)
+            batch_size = input_features.size(0)
+            
+            decoder_input_ids = torch.ones((batch_size * num_beams, 1), dtype=torch.long, device=input_features.device) * self.config.decoder_start_token_id
+            beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_features.device)
+            
+            for step in range(max_length - 1):
+                outputs = self.decoder(decoder_input_ids, encoder_outputs.repeat_interleave(num_beams, dim=0))
+                next_token_logits = outputs[:, -1, :]
+                next_token_scores = torch.log_softmax(next_token_logits, dim=-1)
+                
+                beam_scores = beam_scores.view(-1, 1) + next_token_scores
+                beam_scores, beam_tokens = beam_scores.view(batch_size, -1).topk(num_beams, dim=-1)
+                
+                beam_indices = beam_tokens // self.config.n_vocab
+                next_token_id = beam_tokens % self.config.n_vocab
+                decoder_input_ids = torch.cat([decoder_input_ids[beam_indices], next_token_id.unsqueeze(-1)], dim=-1)
+                
+                if torch.all(next_token_id == self.config.eos_token_id):
+                    break
+            
+            return decoder_input_ids
+    
+        def _set_gradient_checkpointing(self, enable=True, gradient_checkpointing_func=checkpoint):
+            self.checkpointing=enable
+            self.gradient_checkpointing_func=gradient_checkpointing_func
+            for module in self.modules():
+                if hasattr(module, 'checkpointing'):
+                    module.checkpointing
+                    module.gradient_checkpointing_func=gradient_checkpointing_func
+    
+        def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+            if not self.supports_gradient_checkpointing:
+                raise ValueError(f"{self.__class__.__name__} does not support gradient checkpointing.")
+            if gradient_checkpointing_kwargs is None:
+                gradient_checkpointing_kwargs={"use_reentrant": True}
+            gradient_checkpointing_func=functools.partial(checkpoint, **gradient_checkpointing_kwargs)
+            self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
+            
+        def save_pretrained(self, save_directory):
+            if not os.path.exists(save_directory):
+                os.makedirs(save_directory)
+    
+            model_path = os.path.join(save_directory, 'pytorch_model.bin')
+            torch.save(self.state_dict(), model_path)
+    
+            config_path = os.path.join(save_directory, 'config.json')
+            with open(config_path, 'w') as f:
+                json.dump(self.config.to_dict(), f)
+        
+        @classmethod
+        def from_pretrained(cls, load_directory):
+            config_path = os.path.join(load_directory, 'config.json')
+            with open(config_path, 'r') as f:
+                config_dict = json.load(f)
+            
+            config = EchoConfig(**config_dict) 
+            model = cls(config)
+    
+            model_path = os.path.join(load_directory, 'pytorch_model.bin')
+            state_dict = torch.load(model_path)
+            model.load_state_dict(state_dict)
+            
+            return model
+    
+        def to_dict(self):
+            return {
+                "architectures": ["Echo"],
+                "model_type": "Echo",
+                "n_mels": self.n_mels,
+                "n_audio_ctx": self.n_audio_ctx,
+                "n_audio_head": self.n_audio_head,
+                "n_audio_layer": self.n_audio_layer,
+                "n_audio_state": self.n_audio_state,
+                "n_vocab": self.n_vocab,
+                "n_text_ctx": self.n_text_ctx,
+                "n_text_head": self.n_text_head,
+                "n_text_layer": self.n_text_layer,
+                "n_text_state": self.n_text_state,
+                "n_dist": self.n_dist,
+                "n_freq": self.n_freq,
+                "cross_attn": self.cross_attn,
+                "hybrid_attn": self.hybrid_attn,
+                "bos_token_id": self.bos_token_id,
+                "eos_token_id": self.eos_token_id,
+                "pad_token_id": self.pad_token_id,
+                "decoder_start_token_id": self.decoder_start_token_id,
+                "torch_dtype": self.float32,
+                "use_bfloat16": True,
+                "is_encoder_decoder": True,
+            }
+    
+    
     config = EchoConfig(
-        base=10000,
-        bos_token_id=50257,
-        decoder_start_token_id=50258,
-        eos_token_id=50257,
-        init_std=0.02,
-        max_dist=128,
-        n_audio_ctx=1500,
-        n_audio_head=16,
-        n_audio_layer=20, 
-        n_audio_state=1024,
-        n_mels=128,
-        n_text_ctx=448,
-        n_text_head=16,
-        n_text_layer=16,
-        n_text_state=1024,
-        pad_token_id=50257,
-        n_vocab=51865,
-        )
-
-##  Echo
-### Evaluation: - Step 1000 - Loss: 2.7929 - WER - 41.200828 
-step-1000
-##### Last Prediction:  his all hopes from back who may I will never see serious again unless I nor with me the not so words we will said of us turn back cried his hopes and its not added!!!!!!!!!!!!!!!!!!!!!!!!!!!
-##### Label: At all events turn back who may I will never see Greece again unless I carry with me the Golden Fleece we will none of us turn back cried his nine and forty brave comrades
-
-------
-
-
-## Whisper
-### Evaluation: - Step 1000 - Loss: 28.3524 - WER - 78.379178
-step-1000
-##### Last Prediction: And the all events the to who may had will the the the to to I the a me other to to to to we will to the us to to to his to the to to 
-to!!!!!!!!!!!!!!!!!!!!!!!!!!!
-##### Label: At all events turn back who may I will never see Greece again unless I carry with me the Golden Fleece we will none of us turn back cried his nine and forty brave comrades
-
-------
-
-
-
-### Metrics for an Echo model (medium) from scratch (not pretrained) over 1000 steps of training :
-
-<table>
-</div>
-    <progress value='1000' max='1000' style='width:300px; height:20px; vertical-align: middle;'></progress>
-</div>
-<table border="2" class="dataframe">
-  <thead>
- <tr style="text-align: left;">
-      <th>Step</th>
-      <th>Training Loss</th>
-      <th>Validation Loss</th>
-      <th>Wer</th>
-      <th>Accuracy</th>
-      <th>Precision</th>
-      <th>Recall</th>
-      <th>F1</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>0</td>
-      <td>No log</td>
-      <td>11.088348</td>
-      <td>114.226560</td>
-      <td>0.000000</td>
-      <td>0.000000</td>
-      <td>0.000000</td>
-      <td>0.000000</td>
-    </tr>
-    <tr>
-      <td>50</td>
-      <td>8.486400</td>
-      <td>8.280888</td>
-      <td>108.754806</td>
-      <td>0.071915</td>
-      <td>0.014912</td>
-      <td>0.071915</td>
-      <td>0.021198</td>
-    </tr>
-    <tr>
-      <td>100</td>
-      <td>7.762600</td>
-      <td>7.546603</td>
-      <td>102.218279</td>
-      <td>0.096644</td>
-      <td>0.052328</td>
-      <td>0.096644</td>
-      <td>0.054700</td>
-    </tr>
-    <tr>
-      <td>150</td>
-      <td>7.126700</td>
-      <td>7.246966</td>
-      <td>100.473233</td>
-      <td>0.089579</td>
-      <td>0.055702</td>
-      <td>0.089579</td>
-      <td>0.058204</td>
-    </tr>
-    <tr>
-      <td>200</td>
-      <td>7.581300</td>
-      <td>7.112317</td>
-      <td>105.501331</td>
-      <td>0.087560</td>
-      <td>0.064674</td>
-      <td>0.087560</td>
-      <td>0.065928</td>
-    </tr>
-    <tr>
-      <td>250</td>
-      <td>7.182800</td>
-      <td>6.953177</td>
-      <td>102.395741</td>
-      <td>0.118849</td>
-      <td>0.060984</td>
-      <td>0.118849</td>
-      <td>0.067212</td>
-    </tr>
-    <tr>
-      <td>300</td>
-      <td>7.429000</td>
-      <td>6.860844</td>
-      <td>87.133984</td>
-      <td>0.178148</td>
-      <td>0.124331</td>
-      <td>0.178148</td>
-      <td>0.135332</td>
-    </tr>
-    <tr>
-      <td>350</td>
-      <td>6.206500</td>
-      <td>6.202377</td>
-      <td>91.866312</td>
-      <td>0.207923</td>
-      <td>0.155767</td>
-      <td>0.207923</td>
-      <td>0.163332</td>
-    </tr>
-    <tr>
-      <td>400</td>
-      <td>5.880600</td>
-      <td>5.737767</td>
-      <td>84.945282</td>
-      <td>0.257128</td>
-      <td>0.202511</td>
-      <td>0.257128</td>
-      <td>0.209760</td>
-    </tr>
-    <tr>
-      <td>450</td>
-      <td>5.165900</td>
-      <td>5.352962</td>
-      <td>82.460810</td>
-      <td>0.282614</td>
-      <td>0.245499</td>
-      <td>0.282614</td>
-      <td>0.244798</td>
-    </tr>
-    <tr>
-      <td>500</td>
-      <td>4.864500</td>
-      <td>5.014288</td>
-      <td>78.053830</td>
-      <td>0.334847</td>
-      <td>0.290442</td>
-      <td>0.334847</td>
-      <td>0.287975</td>
-    </tr>
-    <tr>
-      <td>550</td>
-      <td>4.800300</td>
-      <td>4.641736</td>
-      <td>72.848270</td>
-      <td>0.383043</td>
-      <td>0.305948</td>
-      <td>0.383043</td>
-      <td>0.322512</td>
-    </tr>
-    <tr>
-      <td>600</td>
-      <td>4.749200</td>
-      <td>4.243003</td>
-      <td>64.862467</td>
-      <td>0.448902</td>
-      <td>0.360028</td>
-      <td>0.448902</td>
-      <td>0.380816</td>
-    </tr>
-    <tr>
-      <td>650</td>
-      <td>3.972400</td>
-      <td>3.941687</td>
-      <td>60.130139</td>
-      <td>0.495079</td>
-      <td>0.389808</td>
-      <td>0.495079</td>
-      <td>0.422348</td>
-    </tr>
-    <tr>
-      <td>700</td>
-      <td>3.808100</td>
-      <td>3.702391</td>
-      <td>58.947057</td>
-      <td>0.504668</td>
-      <td>0.363262</td>
-      <td>0.504668</td>
-      <td>0.409206</td>
-    </tr>
-    <tr>
-      <td>750</td>
-      <td>3.712500</td>
-      <td>3.417185</td>
-      <td>53.179533</td>
-      <td>0.557406</td>
-      <td>0.439535</td>
-      <td>0.557406</td>
-      <td>0.479163</td>
-    </tr>
-    <tr>
-      <td>800</td>
-      <td>3.816800</td>
-      <td>3.236211</td>
-      <td>51.730257</td>
-      <td>0.572294</td>
-      <td>0.423974</td>
-      <td>0.572294</td>
-      <td>0.473410</td>
-    </tr>
-    <tr>
-      <td>850</td>
-      <td>3.274800</td>
-      <td>3.051460</td>
-      <td>46.909198</td>
-      <td>0.612415</td>
-      <td>0.472236</td>
-      <td>0.612415</td>
-      <td>0.518319</td>
-    </tr>
-    <tr>
-      <td>900</td>
-      <td>2.740500</td>
-      <td>2.923042</td>
-      <td>44.661343</td>
-      <td>0.641686</td>
-      <td>0.519547</td>
-      <td>0.641686</td>
-      <td>0.561009</td>
-    </tr>
-    <tr>
-      <td>950</td>
-      <td>2.811200</td>
-      <td>2.829455</td>
-      <td>40.757172</td>
-      <td>0.673732</td>
-      <td>0.560039</td>
-      <td>0.673732</td>
-      <td>0.598650</td>
-    </tr>
-    <tr>
-      <td>1000</td>
-      <td>2.752000</td>
-      <td>2.792902</td>
-      <td>41.200828</td>
-      <td>0.669190</td>
-      <td>0.543252</td>
-      <td>0.669190</td>
-      <td>0.586206</td>
-    </tr>
-  </tbody>
-</table><p>
-
-
-
-
-
-### Metrics for an Openai whisper model (medium) from scratch (not pretrained) over 1000 steps of training :
-
-<table>
-</div>
-    <progress value='1000' max='1000' style='width:300px; height:20px; vertical-align: middle;'></progress>
-</div>
-<table border="2" class="dataframe">
- <thead>
-   <tr style="text-align: left;">
-      <th>Step</th>
-      <th>Training Loss</th>
-      <th>Validation Loss</th>
-      <th>Wer</th>
-      <th>Accuracy</th>
-      <th>Precision</th>
-      <th>Recall</th>
-      <th>F1</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>20</td>
-      <td>94.403200</td>
-      <td>94.263489</td>
-      <td>91.008577</td>
-      <td>0.025738</td>
-      <td>0.014635</td>
-      <td>0.025738</td>
-      <td>0.017516</td>
-    </tr>
-    <tr>
-      <td>40</td>
-      <td>85.520300</td>
-      <td>77.752335</td>
-      <td>80.981958</td>
-      <td>0.025486</td>
-      <td>0.012869</td>
-      <td>0.025486</td>
-      <td>0.017075</td>
-    </tr>
-    <tr>
-      <td>60</td>
-      <td>78.748400</td>
-      <td>72.717720</td>
-      <td>83.407276</td>
-      <td>0.050467</td>
-      <td>0.050467</td>
-      <td>0.050467</td>
-      <td>0.050467</td>
-    </tr>
-    <tr>
-      <td>80</td>
-      <td>71.716200</td>
-      <td>63.925533</td>
-      <td>82.283348</td>
-      <td>0.025486</td>
-      <td>0.025486</td>
-      <td>0.025486</td>
-      <td>0.025486</td>
-    </tr>
-    <tr>
-      <td>100</td>
-      <td>61.559900</td>
-      <td>64.625153</td>
-      <td>101.863354</td>
-      <td>0.070654</td>
-      <td>0.015002</td>
-      <td>0.070654</td>
-      <td>0.021354</td>
-    </tr>
-    <tr>
-      <td>120</td>
-      <td>57.366200</td>
-      <td>57.688732</td>
-      <td>90.505768</td>
-      <td>0.043654</td>
-      <td>0.013775</td>
-      <td>0.043654</td>
-      <td>0.018800</td>
-    </tr>
-    <tr>
-      <td>140</td>
-      <td>54.002500</td>
-      <td>51.427681</td>
-      <td>84.057971</td>
-      <td>0.025233</td>
-      <td>0.012617</td>
-      <td>0.025233</td>
-      <td>0.016822</td>
-    </tr>
-    <tr>
-      <td>160</td>
-      <td>53.483600</td>
-      <td>48.576084</td>
-      <td>78.231293</td>
-      <td>0.025233</td>
-      <td>0.012617</td>
-      <td>0.025233</td>
-      <td>0.016822</td>
-    </tr>
-    <tr>
-      <td>180</td>
-      <td>47.297000</td>
-      <td>47.999882</td>
-      <td>88.671991</td>
-      <td>0.061065</td>
-      <td>0.050653</td>
-      <td>0.061065</td>
-      <td>0.050832</td>
-    </tr>
-    <tr>
-      <td>200</td>
-      <td>49.127000</td>
-      <td>46.261742</td>
-      <td>85.803017</td>
-      <td>0.068887</td>
-      <td>0.051025</td>
-      <td>0.068887</td>
-      <td>0.051551</td>
-    </tr>
-    <tr>
-      <td>220</td>
-      <td>42.094100</td>
-      <td>43.525475</td>
-      <td>75.510204</td>
-      <td>0.027252</td>
-      <td>0.014096</td>
-      <td>0.027252</td>
-      <td>0.018415</td>
-    </tr>
-    <tr>
-      <td>240</td>
-      <td>49.604300</td>
-      <td>42.715565</td>
-      <td>83.703046</td>
-      <td>0.025233</td>
-      <td>0.012617</td>
-      <td>0.025233</td>
-      <td>0.016822</td>
-    </tr>
-    <tr>
-      <td>260</td>
-      <td>40.123900</td>
-      <td>50.845093</td>
-      <td>117.598344</td>
-      <td>0.019934</td>
-      <td>0.000403</td>
-      <td>0.019934</td>
-      <td>0.000790</td>
-    </tr>
-    <tr>
-      <td>280</td>
-      <td>43.100900</td>
-      <td>40.379704</td>
-      <td>80.893227</td>
-      <td>0.062074</td>
-      <td>0.051841</td>
-      <td>0.062074</td>
-      <td>0.052830</td>
-    </tr>
-    <tr>
-      <td>300</td>
-      <td>46.004100</td>
-      <td>39.359657</td>
-      <td>86.187518</td>
-      <td>0.062831</td>
-      <td>0.059012</td>
-      <td>0.062831</td>
-      <td>0.059481</td>
-    </tr>
-    <tr>
-      <td>320</td>
-      <td>40.832000</td>
-      <td>39.853710</td>
-      <td>93.286010</td>
-      <td>0.025233</td>
-      <td>0.012617</td>
-      <td>0.025233</td>
-      <td>0.016822</td>
-    </tr>
-    <tr>
-      <td>340</td>
-      <td>43.416100</td>
-      <td>39.105030</td>
-      <td>98.432416</td>
-      <td>0.050214</td>
-      <td>0.013454</td>
-      <td>0.050214</td>
-      <td>0.018442</td>
-    </tr>
-    <tr>
-      <td>360</td>
-      <td>37.006500</td>
-      <td>37.590755</td>
-      <td>97.722567</td>
-      <td>0.090336</td>
-      <td>0.052648</td>
-      <td>0.090336</td>
-      <td>0.054604</td>
-    </tr>
-    <tr>
-      <td>380</td>
-      <td>41.060600</td>
-      <td>37.231003</td>
-      <td>96.687371</td>
-      <td>0.091597</td>
-      <td>0.052742</td>
-      <td>0.091597</td>
-      <td>0.054778</td>
-    </tr>
-    <tr>
-      <td>400</td>
-      <td>39.723700</td>
-      <td>37.233490</td>
-      <td>98.846495</td>
-      <td>0.032046</td>
-      <td>0.012809</td>
-      <td>0.032046</td>
-      <td>0.017152</td>
-    </tr>
-    <tr>
-      <td>420</td>
-      <td>36.098600</td>
-      <td>34.588448</td>
-      <td>80.419994</td>
-      <td>0.049962</td>
-      <td>0.016635</td>
-      <td>0.049962</td>
-      <td>0.023593</td>
-    </tr>
-    <tr>
-      <td>440</td>
-      <td>36.171700</td>
-      <td>35.197464</td>
-      <td>84.383319</td>
-      <td>0.056523</td>
-      <td>0.051583</td>
-      <td>0.056523</td>
-      <td>0.052213</td>
-    </tr>
-    <tr>
-      <td>460</td>
-      <td>40.916200</td>
-      <td>34.445030</td>
-      <td>91.097308</td>
-      <td>0.083018</td>
-      <td>0.054857</td>
-      <td>0.083018</td>
-      <td>0.057037</td>
-    </tr>
-    <tr>
-      <td>480</td>
-      <td>31.560100</td>
-      <td>34.273525</td>
-      <td>93.433895</td>
-      <td>0.062579</td>
-      <td>0.058669</td>
-      <td>0.062579</td>
-      <td>0.053839</td>
-    </tr>
-    <tr>
-      <td>500</td>
-      <td>31.555100</td>
-      <td>35.701134</td>
-      <td>93.611358</td>
-      <td>0.029018</td>
-      <td>0.013088</td>
-      <td>0.029018</td>
-      <td>0.017486</td>
-    </tr>
-    <tr>
-      <td>520</td>
-      <td>31.655800</td>
-      <td>33.348915</td>
-      <td>96.598639</td>
-      <td>0.059046</td>
-      <td>0.050900</td>
-      <td>0.059046</td>
-      <td>0.051067</td>
-    </tr>
-    <tr>
-      <td>540</td>
-      <td>31.640500</td>
-      <td>35.189606</td>
-      <td>105.057675</td>
-      <td>0.093111</td>
-      <td>0.058158</td>
-      <td>0.093111</td>
-      <td>0.062370</td>
-    </tr>
-    <tr>
-      <td>560</td>
-      <td>33.660200</td>
-      <td>32.557995</td>
-      <td>83.584738</td>
-      <td>0.062579</td>
-      <td>0.062538</td>
-      <td>0.062579</td>
-      <td>0.059354</td>
-    </tr>
-    <tr>
-      <td>580</td>
-      <td>32.580900</td>
-      <td>32.592445</td>
-      <td>94.971902</td>
-      <td>0.063084</td>
-      <td>0.065103</td>
-      <td>0.063084</td>
-      <td>0.052611</td>
-    </tr>
-    <tr>
-      <td>600</td>
-      <td>35.922800</td>
-      <td>34.419098</td>
-      <td>106.033718</td>
-      <td>0.095887</td>
-      <td>0.052758</td>
-      <td>0.095887</td>
-      <td>0.054830</td>
-    </tr>
-    <tr>
-      <td>620</td>
-      <td>30.603100</td>
-      <td>31.972431</td>
-      <td>95.652174</td>
-      <td>0.067626</td>
-      <td>0.055185</td>
-      <td>0.067626</td>
-      <td>0.054872</td>
-    </tr>
-    <tr>
-      <td>640</td>
-      <td>30.338900</td>
-      <td>31.226700</td>
-      <td>82.431233</td>
-      <td>0.069140</td>
-      <td>0.056380</td>
-      <td>0.069140</td>
-      <td>0.059379</td>
-    </tr>
-    <tr>
-      <td>660</td>
-      <td>28.825100</td>
-      <td>30.914654</td>
-      <td>85.595978</td>
-      <td>0.076962</td>
-      <td>0.062543</td>
-      <td>0.076962</td>
-      <td>0.058539</td>
-    </tr>
-    <tr>
-      <td>680</td>
-      <td>29.440200</td>
-      <td>30.539631</td>
-      <td>86.424135</td>
-      <td>0.085037</td>
-      <td>0.062852</td>
-      <td>0.085037</td>
-      <td>0.064045</td>
-    </tr>
-    <tr>
-      <td>700</td>
-      <td>29.113400</td>
-      <td>30.472658</td>
-      <td>83.614315</td>
-      <td>0.066616</td>
-      <td>0.060417</td>
-      <td>0.066616</td>
-      <td>0.058387</td>
-    </tr>
-    <tr>
-      <td>720</td>
-      <td>31.490900</td>
-      <td>30.239878</td>
-      <td>90.860692</td>
-      <td>0.094373</td>
-      <td>0.054398</td>
-      <td>0.094373</td>
-      <td>0.057342</td>
-    </tr>
-    <tr>
-      <td>740</td>
-      <td>28.677400</td>
-      <td>29.869360</td>
-      <td>82.135463</td>
-      <td>0.091597</td>
-      <td>0.058511</td>
-      <td>0.091597</td>
-      <td>0.063113</td>
-    </tr>
-    <tr>
-      <td>760</td>
-      <td>34.107900</td>
-      <td>29.662447</td>
-      <td>83.762201</td>
-      <td>0.092607</td>
-      <td>0.063801</td>
-      <td>0.092607</td>
-      <td>0.065499</td>
-    </tr>
-    <tr>
-      <td>780</td>
-      <td>34.549900</td>
-      <td>29.734320</td>
-      <td>89.559302</td>
-      <td>0.086551</td>
-      <td>0.058246</td>
-      <td>0.086551</td>
-      <td>0.062451</td>
-    </tr>
-    <tr>
-      <td>800</td>
-      <td>30.139900</td>
-      <td>29.545433</td>
-      <td>87.281869</td>
-      <td>0.072925</td>
-      <td>0.059602</td>
-      <td>0.072925</td>
-      <td>0.062393</td>
-    </tr>
-    <tr>
-      <td>820</td>
-      <td>31.375100</td>
-      <td>29.174932</td>
-      <td>85.595978</td>
-      <td>0.092102</td>
-      <td>0.055116</td>
-      <td>0.092102</td>
-      <td>0.058551</td>
-    </tr>
-    <tr>
-      <td>840</td>
-      <td>27.732400</td>
-      <td>28.951723</td>
-      <td>78.970719</td>
-      <td>0.081756</td>
-      <td>0.064148</td>
-      <td>0.081756</td>
-      <td>0.065059</td>
-    </tr>
-    <tr>
-      <td>860</td>
-      <td>30.152400</td>
-      <td>28.902292</td>
-      <td>87.015676</td>
-      <td>0.076205</td>
-      <td>0.064815</td>
-      <td>0.076205</td>
-      <td>0.064552</td>
-    </tr>
-    <tr>
-      <td>880</td>
-      <td>34.486900</td>
-      <td>28.868065</td>
-      <td>91.688849</td>
-      <td>0.071411</td>
-      <td>0.069928</td>
-      <td>0.071411</td>
-      <td>0.065083</td>
-    </tr>
-    <tr>
-      <td>900</td>
-      <td>25.140400</td>
-      <td>28.629511</td>
-      <td>80.005915</td>
-      <td>0.085289</td>
-      <td>0.065063</td>
-      <td>0.085289</td>
-      <td>0.065973</td>
-    </tr>
-    <tr>
-      <td>920</td>
-      <td>31.664500</td>
-      <td>28.500097</td>
-      <td>77.846791</td>
-      <td>0.090336</td>
-      <td>0.065317</td>
-      <td>0.090336</td>
-      <td>0.070051</td>
-    </tr>
-    <tr>
-      <td>940</td>
-      <td>26.276000</td>
-      <td>28.503267</td>
-      <td>81.514345</td>
-      <td>0.084532</td>
-      <td>0.068520</td>
-      <td>0.084532</td>
-      <td>0.068082</td>
-    </tr>
-    <tr>
-      <td>960</td>
-      <td>30.347800</td>
-      <td>28.445673</td>
-      <td>80.390417</td>
-      <td>0.078981</td>
-      <td>0.074482</td>
-      <td>0.078981</td>
-      <td>0.069878</td>
-    </tr>
-    <tr>
-      <td>980</td>
-      <td>25.139200</td>
-      <td>28.366508</td>
-      <td>79.177758</td>
-      <td>0.092354</td>
-      <td>0.064299</td>
-      <td>0.092354</td>
-      <td>0.062803</td>
-    </tr>
-    <tr>
-      <td>1000</td>
-      <td>28.350800</td>
-      <td>28.352432</td>
-      <td>78.379178</td>
-      <td>0.089831</td>
-      <td>0.064653</td>
-      <td>0.089831</td>
-      <td>0.067847</td>
-    </tr>
-  </tbody>
-</table><p>
-
-
-But the coolest part is that my logits schematic kinda looks like arms pointing to the left when I flip it on its side.
-![logits_schematic2](https://github.com/user-attachments/assets/0c817af3-5967-4465-b086-4109e725e6c4)
+            model_type = "Echo",
+            architectures = "Transformer",
+            torch_dtype = torch.float32,
+            n_mels = 80,
+            n_audio_ctx = 1500,
+            n_audio_head = 16,
+            n_audio_layer = 20,
+            n_audio_state = 1024,
+            n_vocab = 51865,
+            n_text_ctx = 448,
+            n_text_head = 16,
+            n_text_layer = 16,
+            n_text_state = 1024,
+            n_dist = 128,
+            n_freq = 10000,
+            bos_token_id = 50257,
+            eos_token_id = 50257,
+            pad_token_id = 50257,
+            decoder_start_token_id = 50258,
+            hybrid_attn = False, 
+            cross_attn = False,
+            ###
+            use_bfloat16 = True,
+            is_encoder_decoder = True,
+            tie_word_embeddings = False,
+            do_sample = True,
+            tokenizer_class = "WhisperTokenizer"
+            )
+    
+    model=Echo(config=config).to(device)
+    model.apply_initialization(module)
+    
+    
+    from datetime import datetime
+    log_dir=os.path.join('./output/', datetime.now().strftime('%Y-%m-%d_%H'))
+    os.makedirs(log_dir, exist_ok=True)
+    
+    name="/echo_test/"
+    config.save_pretrained(log_dir+name)
+    model.save_pretrained(log_dir+name)
+    model = Echo.from_pretrained((log_dir+name)).to(device)
+    
+    
+    
+    feature_extractor=WhisperFeatureExtractor.from_pretrained("openai/whisper-small", do_normalize=True, sampling_rate=16000, return_tensors="pt")
+    tokenizer=WhisperTokenizer.from_pretrained("openai/whisper-small", language="en", task="transcribe")
+    processor=WhisperProcessor.from_pretrained("openai/whisper-small")
+    
+    class GradientClippingCallback(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            torch.nn.utils.clip_grad_norm_(parameters=kwargs["model"].parameters(), max_norm=0.98)
+    
+    metric=evaluate.load(path="wer")
+    
+    def compute_metrics(eval_pred, tokenizer=tokenizer, metric=metric):
+    
+        pred_logits = eval_pred.predictions
+        label_ids = eval_pred.label_ids
+        pred_ids = pred_logits[0] if isinstance(pred_logits, tuple) else pred_logits
+        if pred_ids.ndim == 3:
+            pred_ids = np.argmax(pred_ids, axis=-1)
+    
+        label_ids[label_ids == -100] = tokenizer.pad_token_id
+        pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+        
+        wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+        sample_index = 0
+        print(f"Prediction: {pred_str[sample_index]}")
+        print(f"Label: {label_str[sample_index]}")
+        print("-" * 10)
+    
+        pred_flat = pred_ids.flatten()
+        labels_flat = label_ids.flatten()
+        mask = labels_flat != tokenizer.pad_token_id
+    
+        return {"wer": wer}
+    
+    @dataclass
+    class DataCollatorSpeechSeq2SeqWithPadding:
+        processor: Any
+        tokenizer: Any
+        feature_extractor: Any
+    
+        def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+            input_features=[{"input_features": feature["input_features"]} for feature in features]
+            batch=feature_extractor.pad(input_features, return_tensors="pt")
+            label_features=[{"input_ids": feature["labels"]} for feature in features]
+            labels_batch=tokenizer.pad(label_features, return_tensors="pt")
+            labels=labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+            if (labels[:, 0] == tokenizer.bos_token_id).all().cpu().item():
+                labels=labels[:, 1:]
+            batch["labels"]=labels
+            return batch
+    
+    def get_length_of_dataset(dataset):
+        length=0
+        for item in dataset:
+            length += len(item["audio"]["array"]) / item["audio"]["sampling_rate"]
+        return length / 3600
+    
+    def prepare_dataset(batch):
+        audio = batch["audio"]
+        batch["input_features"] = feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+        batch["labels"] = tokenizer(batch["text"]).input_ids
+        return batch
+    
+    
+    train=load_dataset("fixie-ai/librispeech_asr", "clean", split="train.100", streaming=True, trust_remote_code=True).map(prepare_dataset).select_columns(["input_features", "labels"])
+    train = train.shuffle(seed=32)
+    
+    test=load_dataset("fixie-ai/librispeech_asr", "clean", split="test", streaming=True, trust_remote_code=True).map(prepare_dataset).select_columns(["input_features", "labels"]).take(100)
+    
+    
+    data_collator=DataCollatorSpeechSeq2SeqWithPadding(processor=processor, tokenizer=tokenizer, feature_extractor=feature_extractor)
+    
+    metric=evaluate.load(path="wer")
+    tb_writer=SummaryWriter(log_dir=log_dir)
+    
+    
+    ### 
+    training_args=Seq2SeqTrainingArguments(
+        output_dir=log_dir,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=1,
+        eval_accumulation_steps=1,
+        tf32=True,
+        bf16=True,
+        learning_rate=3e-6,
+        eval_strategy="steps",
+        warmup_steps=100,
+        max_steps=10000,
+        save_steps=500,
+        eval_steps=100,
+        logging_steps=5,
+        logging_dir=log_dir + "/logs_hf",
+        report_to=["tensorboard"],
+        push_to_hub=False,
+        optim="adafactor",
+        weight_decay=0.0025,
+        disable_tqdm=False,
+        save_total_limit=1,
+        save_strategy="steps",
+        remove_unused_columns=True,
+        label_names=["labels"],
+        # gradient_checkpointing=False,
+        eval_on_start=True,
+        max_grad_norm = 0.98,
+        predict_with_generate=False,
+        generation_max_length = 32,
+        generation_num_beams = 2,
+        # bf16_full_eval = True,
+        # torch_empty_cache_steps = 10,
+    )
+    
+    trainer=Seq2SeqTrainer(
+        args=training_args,
+        model=model,
+        train_dataset=train,
+        eval_dataset=test,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        processing_class=processor,
+        # callbacks=[metrics_callback]
+    )
+    
+    
+    
+    
+    
+    trainer.train(resume_from_checkpoint=False)
+    eval_results=trainer.evaluate()
+    print(eval_results)
+    import tensorboard
+    
+    
+    
+    
+    # print(torch.cuda.memory_summary(device=None, abbreviated=False))
+    
+    
