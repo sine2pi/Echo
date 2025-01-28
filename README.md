@@ -750,32 +750,7 @@
                 gradient_checkpointing_kwargs={"use_reentrant": True}
             gradient_checkpointing_func=functools.partial(checkpoint, **gradient_checkpointing_kwargs)
             self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
-            
-        def save_pretrained(self, save_directory):
-            if not os.path.exists(save_directory):
-                os.makedirs(save_directory)
-    
-            model_path = os.path.join(save_directory, 'pytorch_model.bin')
-            torch.save(self.state_dict(), model_path)
-    
-            config_path = os.path.join(save_directory, 'config.json')
-            with open(config_path, 'w') as f:
-                json.dump(self.config.to_dict(), f)
-        
-        @classmethod
-        def from_pretrained(cls, load_directory):
-            config_path = os.path.join(load_directory, 'config.json')
-            with open(config_path, 'r') as f:
-                config_dict = json.load(f)
-            
-            config = EchoConfig(**config_dict) 
-            model = cls(config)
-    
-            model_path = os.path.join(load_directory, 'pytorch_model.bin')
-            state_dict = torch.load(model_path)
-            model.load_state_dict(state_dict)
-            
-            return model
+
     
         def to_dict(self):
             return {
