@@ -239,7 +239,7 @@ class MultiheadAttention(nn.Module):
 
 
         if MultiheadAttention.use_sdpa:
-            a = scaled_dot_product_attention(q, k, v, is_causal=mask is not None and n_ctx > 1 )
+            a = scaled_dot_product_attention(q, k, v, is_causal=True)
 
             out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = None
