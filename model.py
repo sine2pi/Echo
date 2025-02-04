@@ -71,7 +71,6 @@ class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor: # type: ignore
         return super().forward(x.float()).type(x.dtype)
 
-
 class CombinedRotaryEmbedding(nn.Module):
     def __init__(self, n_state: int, n_head: int, n_freq: float,
                  theta_scale_learnable: bool = True,
@@ -95,7 +94,7 @@ class CombinedRotaryEmbedding(nn.Module):
         self.theta_scale = nn.Parameter(torch.ones(1), requires_grad=theta_scale_learnable)
         self.n_rots_scale = nn.Parameter(torch.ones(1), requires_grad=n_rots_scale_learnable)
 
-        # --- R Matrix ---
+        # --- R Matrix --- loss += embedding_layer.orthogonal_regularization_term()
         self.r_matrix = nn.Parameter(torch.eye(n=self.h_dim), requires_grad=r_matrix_learnable)
 
         # --- Frequency Parameters for RoPE ---
@@ -104,7 +103,7 @@ class CombinedRotaryEmbedding(nn.Module):
 
         # --- Regularization ---
         self.orthogonal_reg_weight = 0.01  
-
+        
     def givens_r_matrix(self, n_state, i, j, theta):
         G = torch.eye(n_state).to(theta.device)
         G[i, i] = math.cos(theta)
@@ -113,26 +112,35 @@ class CombinedRotaryEmbedding(nn.Module):
         G[j, j] = math.cos(theta)
         return G
 
-    def update_base(self, new_base):
+    def update_freq(self, new_base):
         if new_base is not None and new_base != self.n_freq:
             self.n_freq = new_base
             inv_freq = 1.0 / (self.n_freq ** (torch.arange(start=0, end=self.h_dim, step=2).float() / self.h_dim))
             self.inv_freq.data.copy_(inv_freq)
+            self.update_pairs()
+            # print("Pairs updated")
 
     def reset_parameters(self):
         nn.init.orthogonal_(tensor=self.r_matrix)
         nn.init.zeros_(tensor=self.thetas)
 
     def orthogonal_regularization_term(self):
-        """Calculates the orthogonal regularization term for r_matrix."""
         loss = torch.tensor(0.0, device=self.r_matrix.device) 
         if self.r_matrix.requires_grad: 
             product = torch.matmul(self.r_matrix, self.r_matrix.t())
             identity = torch.eye(self.r_matrix.size(0)).to(self.r_matrix.device)
             loss = ((product - identity) ** 2).sum()
         return self.orthogonal_reg_weight * loss
-
-    def forward(self, x):
+   
+    def update_pairs(self):   
+        pairs = []
+        while len(pairs) < self.n_rots:
+            i, j = random.randint(0, self.h_dim - 1), random.randint(0, self.h_dim - 1)
+            if i != j and (i, j) not in pairs and (j, i) not in pairs:
+                pairs.append((i, j))
+        self.r_pairs.data.copy_(torch.tensor(pairs, dtype=torch.float32))
+        
+    def forward(self, x, global_step=None):
         if x.dim() not in [3, 4]:
             raise ValueError(f"Expected input tensor to be 3D or 4D, but got {x.dim()}D")
 
