@@ -629,9 +629,9 @@
             x = F.gelu(self.conv1(x))
             x = F.gelu(self.conv2(x))
             x = x.permute(0, 2, 1)
-            x = self.combined_rotary(x)
             p = self.positional_embedding(torch.arange(x.size(1), device=x.device)).unsqueeze(0)
             x = x + p
+            x = self.combined_rotary(x)
             return x
     
     class TextDecoder(nn.Module):
@@ -677,7 +677,7 @@
             x = self.token_embedding(x) + pos_emb
             x = x.to(xa.dtype)
     
-            # x = self.combined_rotary(x)
+            x = self.combined_rotary(x)
             return x
     
     class EchoConfig(PretrainedConfig):
