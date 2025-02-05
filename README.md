@@ -156,13 +156,8 @@
             x1, x2 = x[..., ::2], x[..., 1::2]
             x = torch.cat(tensors=[x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
             x = x.view(batch_size, seq_len, self.dims)
-    
             return x
-    
             
-    
-    
-    
     class LearnedSinusoidalEmbeddings(nn.Module):
         def __init__(self, n_ctx, dims, checkpoint=False):
             super().__init__()
@@ -358,7 +353,6 @@
     #             x[:, i:end, :] = attn_out
     #         # print(f"Hybrid {x.shape}")
     #         return x
-    
     
     class CombinedSparseAdaptiveAttention(nn.Module):
         def __init__(self, base, dims, head, max_dist, max_span, sparsity_factor):
@@ -568,9 +562,6 @@
                 output[i:end, :, :] = attn_output[:end - i, :, :]
             return output
     
-    
-    
-    
     class ResidualAttentionBlock(nn.Module):
         def __init__(self, base, dims, head, max_dist, win_size, max_span, hybrid):
             super().__init__()
@@ -744,7 +735,6 @@
             self.vocab = vocab
             self.win_size = win_size
     
-    
     class Echo(PreTrainedModel):
         config_class = EchoConfig
         
@@ -781,7 +771,6 @@
                 checkpoint=self.config.checkpoint,
                 cross=self.config.cross,
             )
-    
     
             all_heads = torch.zeros(self.config.t_layer, self.config.t_head, dtype=torch.bool) 
             all_heads[self.config.t_layer // 2:] = True
@@ -1030,8 +1019,6 @@
                 gradient_checkpointing_kwargs = {"use_reentrant": True}
             gradient_checkpointing_func = functools.partial(checkpoint, **gradient_checkpointing_kwargs)
             self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
-            
-    
     
     class GradientClippingCallback(TrainerCallback):
         def on_step_end(self, args, dims, control, **kwargs):
@@ -1166,7 +1153,6 @@
             bos_token_id=50257,
             decoder_start_token_id=50258
             )
-        
         
         config.save_pretrained(log_dir+name)
         model = Echo(config).to(device)
