@@ -513,8 +513,8 @@
         def __init__(self, base, dims, head, max_dist, win_size, max_span=64, sparsity_factor=0.1): 
             super().__init__()
     
-            # self.local_attn = AdaptiveSpanAttention(base, dims, head, max_dist, max_span)
-            self.local_attn = SparseAttention(base, dims, head, max_dist, sparsity_factor)
+            self.local_attn = AdaptiveSpanAttention(base, dims, head, max_dist, max_span)
+            #self.local_attn = SparseAttention(base, dims, head, max_dist, sparsity_factor)
             self.global_attn = MultiheadAttention(base, dims, head, max_dist)
             self.ln_local = LayerNorm(dims)
             self.ln_global = LayerNorm(dims)
@@ -523,8 +523,8 @@
     
         def update_window(self, new_window):
             new_window = max(1, int(new_window + 0.5))
-            self.win_size = new_window
-            # self.local_attn.max_span = new_window
+            win_size = new_window
+            self.local_attn.max_span = win_size
     
         def forward(self, x): 
             win_size = self.win_size
@@ -869,7 +869,7 @@
                 labels = labels.to(logits.device).long()
                 loss = loss_fct(logits.view(-1, self.config.vocab), labels.view(-1))
     
-                # self.adjust_window(loss.item())
+                self.adjust_window(loss.item())
                 self.adjust_base(loss.item())
                 # self.print_update()  
     
