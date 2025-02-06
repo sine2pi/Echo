@@ -21,9 +21,6 @@ warnings.filterwarnings(action="ignore")
 warnings.warn = lambda *args, **kwargs: None
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
-torch_dtype = torch.float32
-torch.set_default_dtype(dtype)
-
 
 #--#
 
