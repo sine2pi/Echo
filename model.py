@@ -8,8 +8,6 @@ from typing import Dict, Optional, Tuple, Union, List, Any
 from transformers.modeling_utils import PreTrainedModel
 from dataclasses import dataclass
 from transformers import (Seq2SeqTrainer, Seq2SeqTrainingArguments, PretrainedConfig, TrainerCallback, WhisperProcessor, WhisperFeatureExtractor, WhisperTokenizerFast)
-
-import evaluate
 from evaluate import module
 from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
 from sklearn.model_selection import KFold, train_test_split
