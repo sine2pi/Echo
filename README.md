@@ -34,12 +34,8 @@
         
         class LayerNorm(nn.LayerNorm):
             def forward(self, x: Tensor) -> Tensor:  # type: ignore
-                return super().forward(x.float()).type(x.dtype)
-        
-        
-        
+                return super().forward(x.float()).type(x.dtype)      
         #--#
-        
         
         class CombinedRotaryEmbedding(nn.Module):
             def __init__(self, base, dims: int, head: int, theta_scale_learnable: bool = True,
@@ -142,9 +138,7 @@
                 x1, x2 = x[..., ::2], x[..., 1::2]
                 x = torch.cat(tensors=[x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
                 x = x.view(batch_size, seq_len, self.dims)
-        
                 return x
-        
         
         class LearnedSinusoidalEmbeddings(nn.Module):
             def __init__(self, n_ctx, dims, checkpoint=False):
@@ -182,10 +176,8 @@
                 sinusoidal_embed = self.sinusoidal_embedding(positions)
                 
                 combined_embedding = rotary_embed + sinusoidal_embed
-                return combined_embedding
-        
-        
-        
+                return combined_embedding      
+                
         #--#
         
         class MultiheadAttention(nn.Module):
@@ -258,9 +250,9 @@
                     qk = qk.detach()
         
                 return out, qk
-        
-        
+                
         #--#
+        
         class AdaptiveSpanAttention(nn.Module):
             def __init__(self, base, dims, head, max_dist, sharpen_longer, win_size, max_span, temp_scale=0.01):  
                 super().__init__()
@@ -412,8 +404,7 @@
                 residual = x
                 x = self.mlp_ln(x)
                 return residual + self.mlp(x)
-        
-        
+                
         #--#
         
         class AudioEncoder(nn.Module):
@@ -456,10 +447,8 @@
         
                 return x
         
-        
         #--#
-        
-        
+                
         class TextDecoder(nn.Module):
             def __init__(self, base, vocab, dims, head, n_layer, n_ctx, max_dist,
                          win_size, max_span, hybrid, checkpoint, cross, sharpen_longer):
@@ -506,7 +495,6 @@
         
                 x = self.combined_rotary(x)
                 return x
-        
         
         #--#
         
@@ -753,6 +741,7 @@
         model.apply_initialization(module=module)
         
         #--#
+        
         feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small", feature_size=128)
         tokenizer = WhisperTokenizerFast.from_pretrained("openai/whisper-small", language="en", task="transcribe")
         processor = WhisperProcessor.from_pretrained("openai/whisper-small")
@@ -872,8 +861,7 @@
         tb_writer = SummaryWriter(log_dir=log_dir)
         metrics_callback = MetricsCallback(tb_writer=tb_writer, tokenizer=tokenizer, metric=metric, log_every_n_steps=5)
         compute_metrics = create_compute_metrics(callback_instance=metrics_callback)
-        
-        
+                
         #--#
         
         training_args = Seq2SeqTrainingArguments(
@@ -917,7 +905,6 @@
             tokenizer=feature_extractor,
             callbacks=[metrics_callback]
         )
-        
         
         #--#
         
