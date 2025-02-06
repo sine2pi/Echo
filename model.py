@@ -36,10 +36,7 @@ class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:  # type: ignore
         return super().forward(x.float()).type(x.dtype)
 
-
-
 #--#
-
 
 class CombinedRotaryEmbedding(nn.Module):
     def __init__(self, base, dims: int, head: int, theta_scale_learnable: bool = True,
@@ -82,7 +79,6 @@ class CombinedRotaryEmbedding(nn.Module):
             inv_freq = 1.0 / (self.base ** (torch.arange(start=0, end=self.h_dim, step=2).float() / self.h_dim))
             self.inv_freq.data.copy_(inv_freq)
             self.update_pairs()
-            # print("Pairs updated")
 
     def reset_parameters(self):
         nn.init.orthogonal_(tensor=self.r_matrix)
@@ -145,7 +141,6 @@ class CombinedRotaryEmbedding(nn.Module):
 
         return x
 
-
 class LearnedSinusoidalEmbeddings(nn.Module):
     def __init__(self, n_ctx, dims, checkpoint=False):
         super().__init__()
@@ -183,8 +178,6 @@ class CombinedPositionalEmbedding(nn.Module):
         
         combined_embedding = rotary_embed + sinusoidal_embed
         return combined_embedding
-
-
 
 #--#
 
@@ -259,8 +252,8 @@ class MultiheadAttention(nn.Module):
 
         return out, qk
 
-
 #--#
+
 class AdaptiveSpanAttention(nn.Module):
     def __init__(self, base, dims, head, max_dist, sharpen_longer, win_size, max_span, temp_scale=0.01):  
         super().__init__()
@@ -507,7 +500,6 @@ class TextDecoder(nn.Module):
         x = self.combined_rotary(x)
         return x
 
-
 #--#
 
 class EchoConfig(PretrainedConfig):
@@ -753,6 +745,7 @@ model = Echo(config).to(device)
 model.apply_initialization(module=module)
 
 #--#
+
 feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small", feature_size=128)
 tokenizer = WhisperTokenizerFast.from_pretrained("openai/whisper-small", language="en", task="transcribe")
 processor = WhisperProcessor.from_pretrained("openai/whisper-small")
@@ -863,16 +856,13 @@ def prepare_dataset(batch):
     return batch
 
 train=load_dataset("fixie-ai/librispeech_asr", "clean", split="train.100", streaming=True, trust_remote_code=True).map(prepare_dataset).select_columns(["input_features", "labels"])
-
 test=load_dataset("fixie-ai/librispeech_asr", "clean", split="test", streaming=True, trust_remote_code=True).map(prepare_dataset).select_columns(["input_features", "labels"])
 
 data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor, tokenizer=tokenizer, feature_extractor=feature_extractor)
-
 metric = evaluate.load(path="wer")
 tb_writer = SummaryWriter(log_dir=log_dir)
 metrics_callback = MetricsCallback(tb_writer=tb_writer, tokenizer=tokenizer, metric=metric, log_every_n_steps=5)
 compute_metrics = create_compute_metrics(callback_instance=metrics_callback)
-
 
 #--#
 
@@ -917,7 +907,6 @@ trainer = Seq2SeqTrainer(
     tokenizer=feature_extractor,
     callbacks=[metrics_callback]
 )
-
 
 #--#
 
