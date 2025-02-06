@@ -467,15 +467,15 @@
         
         class TextDecoder(nn.Module):
             def __init__(self, base, vocab, dims, head, n_layer, n_ctx, max_dist,
-                         win_size, max_span, hybrid, checkpoint, cross):
+                         win_size, max_span, hybrid, checkpoint, cross, sharpen_longer):
                 super().__init__()
                 self.token_embedding = nn.Embedding(vocab, dims)
                 self.positional_embedding = LearnedSinusoidalEmbeddings(n_ctx, dims)
                 self.checkpoint = checkpoint
         
                 self.combined_rotary = CombinedRotaryEmbedding(base, dims, head)
-        
-                self.blocks = nn.ModuleList([ResidualAttentionBlock(base, dims, head, max_dist, win_size, max_span, hybrid) for _ in range(n_layer)])
+
+                self.blocks = nn.ModuleList([ResidualAttentionBlock(base, dims, head, max_dist, win_size, max_span, hybrid, checkpoint, cross, sharpen_longer) for _ in range(n_layer)])
         
                 self.ln_post = LayerNorm(dims)
                 self.ln = LayerNorm(dims)
@@ -608,6 +608,7 @@
                     hybrid=self.config.hybrid,
                     checkpoint=self.config.checkpoint,
                     cross=self.config.cross,
+                    sharpen_longer=self.config.sharpen_longer,
                 )
         
         
