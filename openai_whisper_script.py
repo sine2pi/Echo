@@ -22,8 +22,6 @@ warnings.filterwarnings(action="ignore")
 warnings.warn = lambda *args, **kwargs: None
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
-torch_dtype = torch.float32
-torch.set_default_dtype(dtype)
 
 from whisper.decoding import decode as decode_function
 from whisper.decoding import detect_language as detect_language_function
@@ -38,6 +36,7 @@ except (ImportError, RuntimeError, OSError):
     SDPA_AVAILABLE = False
 
 #--#
+
 @dataclass
 class ModelDimensions:
     n_mels: int
@@ -92,7 +91,6 @@ def disable_sdpa():
         yield
     finally:
         MultiHeadAttention.use_sdpa = prev_state
-
 
 class MultiHeadAttention(nn.Module):
     use_sdpa = True
@@ -419,6 +417,7 @@ class Whisper(nn.Module):
 
 
 #--#
+
 from datetime import datetime
 log_dir = os.path.join('./output/', datetime.now().strftime(format='%Y-%m-%d_%H'))
 os.makedirs(name=log_dir, exist_ok=True)
@@ -445,6 +444,7 @@ model = Whisper(dims=config).to(device=device)
 model.apply_initialization(module=model)
 
 #--#
+
 feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small", feature_size=128)
 tokenizer = WhisperTokenizerFast.from_pretrained("openai/whisper-small", language="en", task="transcribe")
 processor = WhisperProcessor.from_pretrained("openai/whisper-small")
@@ -543,7 +543,6 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         return batch
 
-
 def get_length_of_dataset(dataset):
     length = 0
     for item in dataset:
@@ -567,10 +566,7 @@ compute_metrics = create_compute_metrics(callback_instance=metrics_callback)
 #--#
 
 train=load_dataset("fixie-ai/librispeech_asr", "clean", split="train.100", streaming=True, trust_remote_code=True).map(prepare_dataset).select_columns(["input_features", "labels"]).take(10000)
-
-
 test=load_dataset("fixie-ai/librispeech_asr", "clean", split="test", streaming=True, trust_remote_code=True).map(prepare_dataset).select_columns(["input_features", "labels"]).take(1000)
-
 
 #--#
 
