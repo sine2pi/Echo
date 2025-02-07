@@ -50,7 +50,6 @@ class ModelDimensions:
     n_text_head: int
     n_text_layer: int
 
-
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
         return super().forward(x.float()).type(x.dtype)
@@ -61,18 +60,14 @@ class Linear(nn.Linear):
         return F.linear(
             x,
             self.weight.to(x.dtype),
-            None if self.bias is None else self.bias.to(x.dtype),
-        )
-
+            None if self.bias is None else self.bias.to(x.dtype))
 
 class Conv1d(nn.Conv1d):
     def _conv_forward(
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
     ) -> Tensor:
         return super()._conv_forward(
-            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
-        )
-
+            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
 
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
@@ -81,7 +76,6 @@ def sinusoids(length, channels, max_timescale=10000):
     inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
     scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
-
 
 @contextmanager
 def disable_sdpa():
@@ -144,9 +138,7 @@ class MultiHeadAttention(nn.Module):
             w = F.softmax(qk, dim=-1).to(q.dtype)
             out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = qk.detach()
-
         return out, qk
-
 
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
@@ -244,7 +236,6 @@ class TextDecoder(nn.Module):
         logits = (
             x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
         ).float()
-
         return logits
 
 class ModelDimensions(PretrainedConfig):
@@ -304,6 +295,7 @@ class Whisper(nn.Module):
             n_head=self.dims.n_text_head,
             n_layer=self.dims.n_text_layer,
         )
+        
         all_heads = torch.zeros(
             self.dims.n_text_layer, self.dims.n_text_head, dtype=torch.bool
         )
@@ -372,8 +364,7 @@ class Whisper(nn.Module):
         if labels is not None:
             if dec_input_ids is None:
                 dec_input_ids = self.shift_tokens_right(
-                    input_ids=labels, pad_token_id=self.dims.pad_token_id, decoder_start_token_id=self.dims.decoder_start_token_id
-                )
+                    input_ids=labels, pad_token_id=self.dims.pad_token_id, decoder_start_token_id=self.dims.decoder_start_token_id)
 
         encoded_features = self.encoder(input_features).to(self.device)  
         logits = self.decoder(dec_input_ids, encoded_features)
@@ -383,7 +374,6 @@ class Whisper(nn.Module):
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             labels = labels.to(logits.device).long()
             loss = loss_fct(logits.view(-1, self.dims.n_vocab), labels.view(-1))
-
         return {"loss": loss, "logits": logits}
     
     def _initialize_weights(self, module):
@@ -414,7 +404,6 @@ class Whisper(nn.Module):
 
     def apply_initialization(self, module):
         self._initialize_weights(module=module)
-
 
 #--#
 
@@ -483,7 +472,7 @@ class MetricsCallback(TrainerCallback):
                 
             if dims.global_step % self.log_every_n_steps == 0:
                 total_samples = len(pred_str)  
-                random_indices = random.sample(range(total_samples), 1)  
+                random_indices = random.sample(range(total_samples), 2)  
 
                 for sample_index in random_indices:
                     self.tb_writer.add_text(f"Prediction_{sample_index}", pred_str[sample_index], dims.global_step)
@@ -543,18 +532,11 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         return batch
 
-def get_length_of_dataset(dataset):
-    length = 0
-    for item in dataset:
-        length += len(item["audio"]["array"]) / item["audio"]["sampling_rate"]
-    return length / 3600  
-
 def prepare_dataset(batch):
     audio = batch["audio"]
     batch["input_features"] = feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
     batch["labels"] = tokenizer(batch["text"]).input_ids
     return batch
-
 
 data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor, decoder_start_token_id=config.decoder_start_token_id)
 
