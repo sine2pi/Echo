@@ -1,3 +1,14 @@
+
+<img width="925" alt="eval" src="https://github.com/user-attachments/assets/395fafa4-d505-45bc-b4fa-d650c96ee7ed" />
+
+<img width="925" alt="train" src="https://github.com/user-attachments/assets/955c0cb8-4022-4ee0-9ffa-887e50278d1e" />
+
+
+
+<img width="200" alt="legend" src="https://github.com/user-attachments/assets/bb05d941-7e28-48f1-a507-bd8773bf7aa4" />
+
+        
+        
         #--#
         import base64, gzip, math, os, functools, warnings, numpy as np, torch, transformers, aiohttp, torch.nn.functional as F, evaluate, json, random
         from torch import Tensor, amp, optim, nn
