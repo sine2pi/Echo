@@ -1,4 +1,5 @@
 
+
 import base64, os, evaluate, random, gzip, math, torch, numpy as np, torch.nn.functional as F, json, warnings
 from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
 from datasets import load_dataset, IterableDatasetDict, Audio
@@ -11,7 +12,7 @@ from typing import Dict, Optional, Tuple
 from torch import Tensor, nn
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union, List, Any
-
+from safetensors.torch import save_file, load_file
 from torch.nn.functional import scaled_dot_product_attention
 
 transformers.utils.logging.set_verbosity_error()
@@ -724,44 +725,9 @@ class Echo(nn.Module):
          
         ).to(device=self.device_param)
 
-        all_heads = torch.zeros(
-            self.param.text_layerA, self.param.text_head, dtype=torch.bool
-        )
-        all_heads[self.param.text_layerA // 2 :] = True
-        self.register_buffer(name="alignment_heads", tensor=all_heads.to_sparse(), persistent=False)
-
-    def set_alignment_heads(self, dump: bytes):
-        array = np.frombuffer(
-            gzip.decompress(data=base64.b85decode(b=dump)), dtype=bool
-        ).copy()
-        mask = torch.from_numpy(ndarray=array).reshape(
-            self.param.text_layerA, self.param.text_head
-        )
-        self.register_buffer(name="alignment_heads", tensor=mask.to_sparse(), persistent=False)
-
-    def embed_audio(self, mel: Tensor):
-        return self.encoder(mel)
-
-    def logits(self, tokens: Tensor, audio_features: Tensor):
-        return self.decoder(tokens, audio_features)
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
-
-    @property
-    def is_multilingual(self):
-        return self.param.vocab >= 51865
-
-    @property
-    def num_languages(self):
-        return self.param.vocab - 51765 - int(self.is_multilingual)
-
     def install_kv_cache_hooks(self, cache: Optional[dict] = None):
-
         cache = {**cache} if cache is not None else {}
         hooks = []
-
         def save_to_cache(module, _, output):
             if module not in cache or output.shape[1] > self.param.text_ctx:
                 cache[module] = output
@@ -776,13 +742,8 @@ class Echo(nn.Module):
 
         self.decoder.apply(install_hooks)
         return cache, hooks
-
-    detect_language_function = None
-    transcribe_function = None
-    decode_function = None
             
     def save_pretrained(self, save_directory: str, save_config: bool = True, safe_serialization: bool = False):
-
         if os.path.isfile(save_directory):
             raise AssertionError(f"Provided path ({save_directory}) should be a directory, not a file")
         os.makedirs(save_directory, exist_ok=True)
@@ -810,31 +771,12 @@ class Echo(nn.Module):
                 "encoder_attention_heads": self.param.audio_head,   
                 "encoder_layers": self.param.audio_layerA,
                 "decoder_layers": self.param.text_layerA,
-                "dropout": self.param.dropout,
-                
-            }
+                "dropout": self.param.dropout}
 
             config_file = os.path.join(save_directory, "config.json")
             with open(config_file, "w", encoding="utf-8") as f:
                 json.dump(config_dict, f, indent=2, sort_keys=True)
 
-            model_card_file = os.path.join(save_directory, "README.md")
-            if not os.path.exists(model_card_file):
-                model_card_content = f"""---
-
-    * Model Type: Echo
-    * Vocabulary Size: {self.param.vocab}
-    * Decoder Dimensions: {self.param.text_state}
-    * Encoder Dimensions: {self.param.audio_state}  
-    * Decoder Layers: {self.param.text_layerA}
-    * Encoder Layers: {self.param.audio_layerA}
-    * Decoder Attention Heads: {self.param.text_head}
-    * Encoder Attention Heads: {self.param.audio_head}
-    * Dropout: {self.param.dropout}
-    """
-                with open(model_card_file, "w", encoding="utf-8") as f:
-                    f.write(model_card_content)
-    
     @classmethod
     def from_pretrained(
         cls,
@@ -962,7 +904,6 @@ param = Dimensions(
 
 model = Echo(param=param).to(device=device)
 model.init_weights()
-
 
 token=""
 
@@ -1103,3 +1044,5 @@ trainer = Seq2SeqTrainer(
 )
 
 trainer.train(resume_from_checkpoint=False)
+
+
