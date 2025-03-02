@@ -1194,7 +1194,7 @@ class Echo(nn.Module):
 
 
 class MaxFactor(torch.optim.Optimizer):
-    __version__ = "1.5"
+    __version__ = "0.5"
         
     def __init__(self, params, lr=0.01, beta2_decay=-0.8, eps=(1e-10, 1e-3), d=1.0, 
                  weight_decay=0.01, gamma=0.99, max=False,
