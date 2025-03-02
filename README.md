@@ -1,3 +1,5 @@
+Switched to a pytorch loop because it's more flexible and less of a headache but kept hf datasets because I like datasets. Changed the token shifting (which should never have been part of the model) to an optional toggle in case someone still wants to use hf trainer. Moved the shifting to the collator (where it should be) so if you toggle on shifting in the model forward make sure to use the collator without shifting. 
+
 ``` python
 import base64, os, evaluate, random, gzip, math, torch, numpy as np, json, warnings, time
 from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
