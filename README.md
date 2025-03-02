@@ -1,4 +1,6 @@
 Switched to a pytorch loop because it's more flexible and less of a headache but kept hf datasets because I like datasets. Changed the token shifting (which should never have been part of the model) to an optional toggle in case someone still wants to use hf trainer. Moved the shifting to the collator (where it should be) so if you toggle on shifting in the model forward make sure to use the collator without shifting. 
+        self.PAD_TOKEN_ID = 50257 # HuggingFace compatibility. Check your tokenizer for the correct ID
+        self.START_TOKEN_ID = 50258 # HuggingFace compatibility. Check your tokenizer for the correct ID
 
 ``` python
 import base64, os, evaluate, random, gzip, math, torch, numpy as np, json, warnings, time
@@ -1073,6 +1075,9 @@ class Echo(nn.Module):
             activation=self.param.activation,
         )
 
+        self.PAD_TOKEN_ID = 50257 # HuggingFace compatibility. Check your tokenizer for the correct ID
+        self.START_TOKEN_ID = 50258 # HuggingFace compatibility. Check your tokenizer for the correct ID
+
     @property
     def device(self) -> torch.device:
 
@@ -1081,8 +1086,8 @@ class Echo(nn.Module):
     @staticmethod
     def shift_tokens_right(
         input_ids: torch.Tensor,
-        pad_token_id: int = 50257,
-        decoder_start_token_id: int = 50258,
+        pad_token_id: int = self.PAD_TOKEN_ID,
+        decoder_start_token_id: int = self.START_TOKEN_ID,
     ) -> torch.Tensor:
         """ Shift input tokens right for teacher forcing. Returns: Shifted input tokens """
         batch_size, seq_len = input_ids.shape
@@ -1105,8 +1110,8 @@ class Echo(nn.Module):
         if auto_shift and labels is not None and decoder_input_ids is None:
             decoder_input_ids = self.shift_tokens_right(
                 input_ids=labels,
-                pad_token_id=50257,
-                decoder_start_token_id=50258,
+                pad_token_id=self.PAD_TOKEN_ID,
+                decoder_start_token_id=self.START_TOKEN_ID,
             )
         
         with torch.autocast(device_type="cuda", enabled=torch.cuda.is_available()):
