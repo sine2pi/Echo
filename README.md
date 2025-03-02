@@ -1085,8 +1085,8 @@ class Echo(nn.Module):
     @staticmethod
     def shift_tokens_right(
         input_ids: torch.Tensor,
-        pad_token_id: int = self.PAD_TOKEN_ID,
-        decoder_start_token_id: int = self.START_TOKEN_ID,
+        pad_token_id: int = 50257,
+        decoder_start_token_id: int = 50258,
     ) -> torch.Tensor:
         """ Shift input tokens right for teacher forcing. Returns: Shifted input tokens """
         batch_size, seq_len = input_ids.shape
@@ -1109,8 +1109,8 @@ class Echo(nn.Module):
         if auto_shift and labels is not None and decoder_input_ids is None:
             decoder_input_ids = self.shift_tokens_right(
                 input_ids=labels,
-                pad_token_id=self.PAD_TOKEN_ID,
-                decoder_start_token_id=self.START_TOKEN_ID,
+                pad_token_id=50257,
+                decoder_start_token_id=50258,
             )
         
         with torch.autocast(device_type="cuda", enabled=torch.cuda.is_available()):
