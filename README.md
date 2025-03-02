@@ -1,8 +1,47 @@
-```python         
+``` python
+import base64, os, evaluate, random, gzip, math, torch, numpy as np, json, warnings, time
+from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
+from sklearn.model_selection import train_test_split
+from datasets import load_dataset, IterableDatasetDict, Audio
+from transformers import (Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperProcessor,WhisperFeatureExtractor,
+WhisperTokenizerFast)
+import torch.nn.functional as F
+import logging
+from torch.profiler import profile, ProfilerActivity, record_function
+import transformers
+from safetensors import safe_open
+from torch.amp.grad_scaler import GradScaler
+from itertools import chain
+from torch.utils.checkpoint import checkpoint
+from typing import Dict, Optional, Tuple
+from torch import Tensor, nn
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, Union, List, Any
+from torch.nn.functional import scaled_dot_product_attention
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+import torchaudio.transforms as transforms
+import torch
+import csv
+import numpy as np
+import neologdn
+import whisper
+from torch.utils.tensorboard.writer import SummaryWriter
+from datetime import datetime
+from torch.utils.data import Subset
+import os, random
+from tqdm import tqdm
+
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+transformers.utils.logging.set_verbosity_error()
+device = torch.device(device="cuda:0" if torch.cuda.is_available() else "cpu")
+dtype = torch.float32
+torch.set_default_dtype(dtype)
 
 
 @dataclass
-class Dimensions:
+class Dimensions: #type: ignore
     mels: int
     audio_ctx: int
     audio_state: int
@@ -24,7 +63,6 @@ class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
         return super().forward(input=x.float()).type(dtype=x.dtype)
 
-
 class Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(
@@ -32,7 +70,6 @@ class Linear(nn.Linear):
             weight=self.weight.to(dtype=x.dtype),
             bias=None if self.bias is None else self.bias.to(dtype=x.dtype),
         )
-
 
 class Conv1d(nn.Conv1d):
     def _conv_forward(
@@ -43,135 +80,6 @@ class Conv1d(nn.Conv1d):
             weight=weight.to(dtype=x.dtype),
             bias=None if bias is None else bias.to(dtype=x.dtype),
         )
-
-
-# @torch.jit.script
-# def _apply_qrotation(x: torch.Tensor, theta: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-#     u = u / torch.norm(u)
-#     v = v / torch.norm(v)
-
-#     half_theta = theta / 2
-#     cos_ht = torch.cos(half_theta)
-#     sin_ht = torch.sin(half_theta)
-
-#     q = torch.cat([cos_ht.unsqueeze(0), sin_ht * u])
-    
-#     x_shape = x.shape
-#     x = x.view(-1, 3)
-
-#     uv_cross = torch.cross(u.unsqueeze(0), x)
-#     uuv_cross = torch.cross(u.unsqueeze(0), uv_cross)
-#     x_rot = x + 2 * (q[0] * uv_cross + uuv_cross)
-
-#     x_rot = x_rot.view(*x_shape)
-#     return x_rot
-
-# @torch.jit.script
-# def _create_rotation_matrix(dims: int, i: int, j: int, theta: torch.Tensor, device: torch.device) -> torch.Tensor:
-#     G = torch.eye(dims, device=device)
-#     c, s = torch.cos(theta), torch.sin(theta)
-#     G[i, i], G[j, j] = c, c
-#     G[i, j], G[j, i] = -s, s
-    
-#     if dims == 3:
-#         u = torch.eye(dims, device=device)[i]
-#         v = torch.eye(dims, device=device)[j]
-#         x = torch.eye(dims, device=device)
-        
-#         Q = _apply_qrotation(x, theta=theta, u=u, v=v)
-#         G = (G + Q) / 2
-#     return G
-
-# @torch.jit.script
-# def _apply_rope_transform(
-#     x: torch.Tensor, 
-#     sin: torch.Tensor, 
-#     cos: torch.Tensor
-# ) -> torch.Tensor:
-#     x1, x2 = x[..., ::2], x[..., 1::2]
-#     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-
-
-# class rotary2(nn.Module):
-#     def __init__(self, ctx, dims, heads, base=10000, theta_learnable=False,
-#         rot_learnable=False, matrix_learnable=False, freq_learnable=False,
-#     ):
-#         super().__init__()
-#         self.ctx = ctx
-#         self.dims = dims
-#         self.heads = heads
-#         self.base = base
-
-#         self.head_dim = self.dims // self.heads
-#         self.rot = self.head_dim // 2
-
-#         self.thetas = nn.Parameter(torch.zeros(self.rot))
-#         self.r_pairs = nn.Parameter(torch.rand(self.rot, 2) * self.head_dim)
-#         self.theta_scale = nn.Parameter(torch.ones(1), requires_grad=theta_learnable)
-#         self.rot_scale = nn.Parameter(torch.ones(1), requires_grad=rot_learnable)
-#         self.r_matrix = nn.Parameter(
-#             torch.eye(self.head_dim), requires_grad=matrix_learnable
-#         )
-
-#         freq_data = 1.0 / (
-#             self.base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
-#         )
-
-#         self.inv_freq = nn.Parameter(freq_data, requires_grad=freq_learnable)
-
-#         self.reset_parameters()
-
-#     def reset_parameters(self):
-#         nn.init.orthogonal_(self.r_matrix)
-#         nn.init.zeros_(self.thetas)
-
-#     def q_rotation(self, x, theta, u, v):
-#         return _apply_qrotation(x, theta, u, v)
-
-#     def rotation_matrix(self, dims, i, j, theta):
-#         return _create_rotation_matrix(dims, i, j, theta, theta.device)
-
-#     @torch.jit.script_method # type: ignore
-#     def apply_rotations(self, x: torch.Tensor) -> torch.Tensor:
-#         adjusted_rot = int(self.rot_scale.item() * self.rot)
-#         for k in range(adjusted_rot):
-#             i, j = int(self.r_pairs[k, 0].item()), int(self.r_pairs[k, 1].item())
-#             theta = self.thetas[k] * self.theta_scale
-#             G = _create_rotation_matrix(self.head_dim, i, j, theta, x.device)
-#             x = x @ G
-#         return x
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         batch_size, seq_len = x.shape[0], x.shape[1]
-        
-#         if x.dim() == 3:
-#             if x.shape[2] != self.dims:
-#                 raise ValueError(f"Expected dim {self.dims}, got {x.shape[2]}")
-#             x = x.view(batch_size, seq_len, self.heads, self.head_dim)
-#         elif x.dim() == 4:
-#             if x.shape[2] != self.heads or x.shape[3] != self.head_dim:
-#                 raise ValueError(f"Expected {self.heads} heads and {self.head_dim} head_dim")
-#         else:
-#             raise ValueError(f"Expected 3D or 4D input, got {x.dim()}D")
-
-#         x_flat = x.reshape(-1, self.head_dim)
-#         x_rotated = self.apply_rotations(x_flat)
-#         x_rotated = x_rotated @ self.r_matrix
-        
-#         x = x_rotated.view(batch_size, seq_len, self.heads, self.head_dim)
-        
-#         position = torch.arange(seq_len, device=x.device, dtype=x.dtype).unsqueeze(1)
-#         div_term = self.inv_freq.unsqueeze(0)
-#         sinusoid_inp = position * div_term
-        
-#         sin = torch.sin(sinusoid_inp).unsqueeze(0).unsqueeze(2)
-#         cos = torch.cos(sinusoid_inp).unsqueeze(0).unsqueeze(2)
-        
-#         x = _apply_rope_transform(x, sin, cos)
-        
-#         x = x.view(batch_size, seq_len, self.dims)
-#         x = x * math.sqrt(self.dims)
-#         return x
 
 
 class rotary(nn.Module):
@@ -191,14 +99,9 @@ class rotary(nn.Module):
         self.r_pairs = nn.Parameter(torch.rand(self.rot, 2) * self.head_dim)
         self.theta_scale = nn.Parameter(torch.ones(1), requires_grad=theta_learnable)
         self.rot_scale = nn.Parameter(torch.ones(1), requires_grad=rot_learnable)
-        self.r_matrix = nn.Parameter(
-            torch.eye(self.head_dim), requires_grad=matrix_learnable
-        )
+        self.r_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=matrix_learnable)
 
-        freq_data = 1.0 / (
-            self.base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
-        )
-
+        freq_data = 1.0 / (self.base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         self.inv_freq = nn.Parameter(freq_data, requires_grad=freq_learnable)
 
         self.reset_parameters()
@@ -238,8 +141,7 @@ class rotary(nn.Module):
             u = torch.eye(dims, device=theta.device)[i]
             v = torch.eye(dims, device=theta.device)[j]
             Q = self.q_rotation(
-                torch.eye(dims, device=theta.device), theta=theta, u=u, v=v
-            )
+                torch.eye(dims, device=theta.device), theta=theta, u=u, v=v)
             G = (G + Q) / 2
         return G
 
@@ -289,9 +191,7 @@ class rotary(nn.Module):
         x = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
         x = x.view(batch_size, seq_len, self.dims)
         x = x * math.sqrt(self.dims)
-
         return x
-
 
 class PositionalEncoding(nn.Module):
     def __init__(self, dims, ctx):
@@ -317,9 +217,7 @@ class PositionalEncoding(nn.Module):
         pe = self.pe[:, :seq_len, :]
         x = x * math.sqrt(self.dims)
         x = x + pe
-
         return x
-
 
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
@@ -328,19 +226,6 @@ def sinusoids(length, channels, max_timescale=10000):
     inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
     scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
-
-
-# @torch.jit.script
-# def _manual_attention(q: Tensor, k: Tensor, v: Tensor,  scale: float,
-#     mask: Optional[Tensor] = None,  ctx: int = 0, k_ctx: int = 0
-# ) -> Tuple[Tensor, Tensor]:
-#     qk = (q * scale) @ ((k * scale).transpose(-1, -2))
-#     if mask is not None:
-#         qk = qk + mask[:ctx, :k_ctx]
-#     qk_float = qk.float()
-#     w = F.softmax(qk_float, dim=-1).to(q.dtype)
-#     out = (w @ v)
-#     return out, qk_float
 
 class MultiheadA(nn.Module):
     use_sdpa: bool = True
@@ -365,7 +250,6 @@ class MultiheadA(nn.Module):
 
         self._init_weights()
 
-        self.register_buffer("_has_cuda", torch.tensor(torch.cuda.is_available()))
 
     def _init_weights(self):
 
@@ -417,40 +301,31 @@ class MultiheadA(nn.Module):
 
     def _attention(
         self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
-
-        batch, ctx, _ = q.shape
-        k_ctx = k.size(1)
-
-        head_dim = self.dims // self.heads
-        reshape_dim = (batch, -1, self.heads, head_dim)
-
-        q = q.view(*reshape_dim).transpose(1, 2)
-        k = k.view(batch, k_ctx, self.heads, head_dim).transpose(1, 2)
-        v = v.view(batch, k_ctx, self.heads, head_dim).transpose(1, 2)
+        
+        batch, ctx, dims = q.shape
+        scale = (dims // self.heads) ** -0.25
+        q = q.view(*q.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
+        k = k.view(*k.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
+        v = v.view(*v.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
 
         if MultiheadA.use_sdpa:
-            with torch.autocast(device_type="cuda", enabled=True):
-                out = F.scaled_dot_product_attention(
-                    query=q,
-                    key=k,
-                    value=v,
-                    attn_mask=None,
-                    is_causal=mask is not None and ctx > 1,
-                )
-            out = out.transpose(1, 2).flatten(2)
-            return out, None
+            a = scaled_dot_product_attention(query=q, key=k, value=v, is_causal=mask is not None and ctx > 1)
+            out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+            qk = None
         else:
-            qk = (q * self.scale) @ ((k * self.scale).transpose(-1, -2))
+            qk = (q * scale) @ (k * scale).transpose(-1, -2)
             if mask is not None:
-                qk = qk + mask[:ctx, :k_ctx]
-            qk_float = qk.float()
-            w = F.softmax(qk_float, dim=-1).to(q.dtype)
-            out = (w @ v).transpose(1, 2).flatten(2)
-            print("mulita",out.shape)
-            return out, qk_float.detach()
+                qk = qk + mask[:ctx, :ctx]
+            qk = qk.float()
+
+            w = F.softmax(qk, dim=-1).to(dtype=q.dtype)
+            out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
+            qk = qk.detach()
+
+        return out, qk
 
 
-class MultiHeadB(nn.Module):
+class MultiheadB(nn.Module):
 
     use_sdpa: bool = True
 
@@ -505,39 +380,29 @@ class MultiHeadB(nn.Module):
             k = kv_cache[self.key]
             v = kv_cache[self.value]
 
-        wv, qk = self.qkv_attention(q=q, k=k, v=v, mask=mask)
+        wv, qk = self._attention(q=q, k=k, v=v, mask=mask)
         return self.out(wv), qk
 
-    def qkv_attention(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
-
+    def _attention(
+        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
+        
         batch, ctx, dims = q.shape
         scale = (dims // self.heads) ** -0.25
+        q = q.view(*q.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
+        k = k.view(*k.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
+        v = v.view(*v.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
 
-        q = q.view(batch, ctx, self.heads, -1).permute(0, 2, 1, 3)
-        k = k.view(batch, k.size(1), self.heads, -1).permute(0, 2, 1, 3)
-        v = v.view(batch, v.size(1), self.heads, -1).permute(0, 2, 1, 3)
-
-        if self.use_sdpa and torch.cuda.is_available():
-            with torch.autocast("cuda"):
-                a = scaled_dot_product_attention(
-                    query=q, key=k, value=v, is_causal=mask is not None and ctx > 1
-                )
+        if MultiheadA.use_sdpa:
+            a = scaled_dot_product_attention(query=q, key=k, value=v, is_causal=mask is not None and ctx > 1)
             out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = None
         else:
-
             qk = (q * scale) @ (k * scale).transpose(-1, -2)
             if mask is not None:
                 qk = qk + mask[:ctx, :ctx]
             qk = qk.float()
 
-            w = F.softmax(qk, dim=-1).to(q.dtype)
+            w = F.softmax(qk, dim=-1).to(dtype=q.dtype)
             out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = qk.detach()
 
@@ -585,10 +450,10 @@ class MultiheadC(nn.Module):
             k = kv_cache[self.key]
             v = kv_cache[self.value]
 
-        wv, qk = self.qkv_attention(q=q, k=k, v=v, mask=mask)
+        wv, qk = self._attention(q=q, k=k, v=v, mask=mask)
         return self.out(wv), qk
 
-    def qkv_attention(
+    def _attention(
         self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
     ) -> Tuple[Tensor, Optional[Tensor]]:
 
@@ -740,7 +605,7 @@ class AdaptiveSpan(nn.Module):
                 else 0.5 + self.temp_scale * span_mean
             )
             scores = torch.matmul(q, k.transpose(-2, -1))
-            weights = torch.softmax((scores / temperature) * self.scale, dim=-1)
+            weights = torch.softmax((scores / temperature) * self.scale, dim=-1) # type: ignore
             out = torch.matmul(weights, v)
             out = out.permute(0, 2, 1, 3).reshape(batch_size, eff_span, self.dims)
 
@@ -860,8 +725,8 @@ class FocusA(nn.Module):
         attn_out = torch.zeros_like(input=query)
         attn_weights = None
 
-        threshold = self.threshold.item()
-        s_factor = self.s_factor.item()
+        threshold = self.threshold.item()# type: ignore
+        s_factor = self.s_factor.item()# type: ignore
 
         while iteration < max_iterations:
             span_len = int(self.max_span * span_scale.mean().item())
@@ -1012,7 +877,7 @@ class Residual(nn.Module):
         act_fn = activation_map.get(activation, nn.ReLU())
 
         self.attn = MultiheadA(dims=dims, heads=heads)
-        self.cross = MultiHeadB(dims=dims, heads=heads)
+        self.cross = MultiheadB(dims=dims, heads=heads)
 
         self.mlp = nn.Sequential(
             nn.Dropout(p=dropout),
@@ -1175,18 +1040,10 @@ class Dimensions:
 
 class Echo(nn.Module):
 
-    PAD_TOKEN_ID = 50257
-    START_TOKEN_ID = 50258
-
     def __init__(self, param: Dimensions):
         super().__init__()
         self.param = param
-
-        self._build_model()
-
         self.to(self.device)
-
-    def _build_model(self):
 
         self.encoder = AudioEncoder(
             param=self.param,
@@ -1222,8 +1079,8 @@ class Echo(nn.Module):
     @staticmethod
     def shift_tokens_right(
         input_ids: torch.Tensor,
-        pad_token_id: int = PAD_TOKEN_ID,
-        decoder_start_token_id: int = START_TOKEN_ID,
+        pad_token_id: int = 50257,
+        decoder_start_token_id: int = 50258,
     ) -> torch.Tensor:
         """ Shift input tokens right for teacher forcing. Returns: Shifted input tokens """
         batch_size, seq_len = input_ids.shape
@@ -1232,37 +1089,40 @@ class Echo(nn.Module):
         shifted_input_ids[:, 0] = decoder_start_token_id
         shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
         return shifted_input_ids
-
+    
     def forward(
         self,
         input_features: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
-        dec_input_ids: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        auto_shift: bool = False,  # New parameter, default False for custom loop
     ) -> Dict[str, Optional[torch.Tensor]]:
-
-        if labels is not None and dec_input_ids is None:
-            dec_input_ids = self.shift_tokens_right(
+        
+        # For HuggingFace compatibility when auto_shift=True
+        decoder_input_ids = input_ids
+        if auto_shift and labels is not None and decoder_input_ids is None:
+            decoder_input_ids = self.shift_tokens_right(
                 input_ids=labels,
-                pad_token_id=self.PAD_TOKEN_ID,
-                decoder_start_token_id=self.START_TOKEN_ID,
+                pad_token_id=50257,
+                decoder_start_token_id=50258,
             )
-
+        
         with torch.autocast(device_type="cuda", enabled=torch.cuda.is_available()):
             encoded_features = self.encoder(input_features)
-
-            logits = self.decoder(dec_input_ids, encoded_features)
-
+            logits = self.decoder(decoder_input_ids, encoded_features)
+        
         loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             labels = labels.to(logits.device).long()
-
+            
             flattened_logits = logits.view(-1, self.param.vocab)
-            flattened_labels = labels.view(-1)
-
+            flattened_labels = labels.view(-1) # type: ignore
+            
             loss = loss_fct(flattened_logits, flattened_labels)
-
+        
         return {"loss": loss, "logits": logits}
+
 
     def _init_weights(self, module):
         std = 0.02
@@ -1297,7 +1157,7 @@ class Echo(nn.Module):
                     nn.init.zeros_(ln.bias)
 
             if hasattr(module, "attn") and hasattr(module.attn, "init_weights"):
-                module.attn.init_weights()
+                module.attn.init_weights() # type: ignore
             if hasattr(module, "cross") and hasattr(module.cross, "init_weights"):
                 module.cross.init_weights()
 
@@ -1315,7 +1175,7 @@ class Echo(nn.Module):
 
         batch_size = audio_features.size(0)
         generated = torch.full(
-            (batch_size, 1), self.START_TOKEN_ID, dtype=torch.long, device=self.device)
+            (batch_size, 1), fill_value=50257, dtype=torch.long, device=self.device)
 
         kv_cache = {}
 
@@ -1325,62 +1185,37 @@ class Echo(nn.Module):
             probs = F.softmax(next_token_logits, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1)
             generated = torch.cat([generated, next_tokens], dim=-1)
-            if (next_tokens == self.PAD_TOKEN_ID).all():
+            if (next_tokens == 50257).all():
                 break
 
         return generated
 
 
-from datetime import datetime
-
-log_dir = os.path.join("./output/Whisper", datetime.now().strftime(format="%m-%d_%H"))
-os.makedirs(name=log_dir, exist_ok=True)
-
-param = Dimensions(
-    mels=128,
-    audio_ctx=1500,
-    audio_head=8,
-    audio_layerA=8,
-    audio_layerB=2,
-    audio_state=1024,
-    vocab=51865,
-    text_ctx=448,
-    text_head=8,
-    text_layerA=8,
-    text_layerB=0,
-    text_state=1024,
-    checkpoint=False,
-    dropout=0.001,
-    activation="gelu",
-)
-
-model = Echo(param=param).to(device=device)
-model.init_weights()
-
 class MaxFactor(torch.optim.Optimizer):
-
-    def __init__(self, params, lr=0.01, beta2_decay=-0.8, eps=(1e-12, 1e-8), d=1.0, 
-                 weight_decay=0.01, gamma=0.99, max=False, full_matrix=False, clip=0, 
-                 lookahead=False, lookahead_k=5):
+    __version__ = "1.5"
+        
+    def __init__(self, params, lr=0.01, beta2_decay=-0.8, eps=(1e-10, 1e-3), d=1.0, 
+                 weight_decay=0.01, gamma=0.99, max=False,
+                 full_matrix=False, clip=0.0):
+        
+        print(f"Using MaxFactor optimizer v{self.__version__}")
         
         eps1, eps2 = eps
         if eps1 is None:
             eps1 = torch.finfo(torch.float32).eps
             
         defaults = dict(
-            lr=lr, beta2_decay=beta2_decay, eps=(eps1, eps2), d=d, weight_decay=weight_decay, 
-            gamma=gamma, max=max, full_matrix=full_matrix, clip=clip, 
-            lookahead=lookahead, lookahead_k=lookahead_k)
+            lr=lr, beta2_decay=beta2_decay, eps=(eps1, eps2), d=d,  weight_decay=weight_decay, 
+            gamma=gamma, max=max, full_matrix=full_matrix, clip=clip)
         
         super().__init__(params=params, defaults=defaults)
-          
-    
+        
     def _get_lr(self, param_group, param_state):
-        step = param_state["step"]
-        min_step = (1e-6 * step + 1e-12)
-        rel_step = min(min_step, 1.0 / step.sqrt())
-        param_scale = max(param_group["eps"][1], param_state["RMS"])
-        return min(param_group["lr"], param_scale * rel_step)
+            step = param_state["step"]
+            step_float = step.item()
+            decay_factor = min(1.0, 1.0 / (step_float ** 0.4  + 1e-12))
+            param_scale = max(param_group["eps"][1], param_state["RMS"])
+            return min(param_group["lr"], param_scale * decay_factor)
 
     @staticmethod
     def _rms(tensor):
@@ -1388,8 +1223,6 @@ class MaxFactor(torch.optim.Optimizer):
             return torch.tensor(0.0, device=tensor.device)
         return tensor.norm() / (tensor.numel() ** 0.5 + 1e-12)
 
-    def _adaptive_clip(self, grad, norm, clip_threshold):
-        return grad * torch.clamp(clip_threshold / (norm + 1e-12), max=1.0)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -1399,7 +1232,7 @@ class MaxFactor(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        for i, group in enumerate(self.param_groups):
+        for group in self.param_groups:
             params_with_grad = []
             grads = []
             row_vars = []
@@ -1429,7 +1262,6 @@ class MaxFactor(torch.optim.Optimizer):
                         state["col_var"] = torch.zeros(col_shape, dtype=torch.float32, device=p.device)
                     
                     state["v"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    
                     state["RMS"] = self._rms(p).item()
 
                 row_vars.append(state.get("row_var", None))
@@ -1439,17 +1271,17 @@ class MaxFactor(torch.optim.Optimizer):
                 params_with_grad.append(p)
                 grads.append(grad)
 
-            for j, param in enumerate(params_with_grad):
-                grad = grads[j]
+            for i, param in enumerate(params_with_grad):
+                grad = grads[i]
                 state = self.state[param]
                                 
                 if group["max"]:
                     grad = -grad
                     
-                step_t = state_steps[j]
-                row_var = row_vars[j]
-                col_var = col_vars[j]
-                vi = v[j]
+                step_t = state_steps[i]
+                row_var = row_vars[i]
+                col_var = col_vars[i]
+                vi = v[i]
                 
                 step_t += 1
                 step_float = step_t.item()
@@ -1458,207 +1290,378 @@ class MaxFactor(torch.optim.Optimizer):
 
                 state = self.state[param]
                 state["RMS"] = self._rms(param).item()
-                adaptive_lr = self._get_lr(param_group=group, param_state=state)
-                                
+                adaptive_lr = self._get_lr(group, state)
+                
                 if group["weight_decay"] != 0:
                     param.mul_(1 - group["lr"] * group["weight_decay"] + eps1)
-                    
-                norm = grad.norm(2)
-                if norm > group["clip"] > 0:
-                    grad = self._adaptive_clip(grad=grad, norm=norm, clip_threshold=group["clip"])
 
                 if param.dim() > 1 and not group["full_matrix"]:
                     row_mean = torch.norm(grad, dim=-1, keepdim=True).square_()
                     row_mean.div_(grad.size(-1) + eps1)
                     row_var.lerp_(row_mean, one_minus_beta2_t)
-                    
                     col_mean = torch.norm(grad, dim=-2, keepdim=True).square_()
                     col_mean.div_(grad.size(-2) + eps1)
                     col_var.lerp_(col_mean, one_minus_beta2_t)
-                    
                     var_estimate = row_var @ col_var
                     max_row_var = row_var.max(dim=-2, keepdim=True)[0]  
                     var_estimate.div_(max_row_var.clamp_(min=eps1))
                 else:
+ 
                     vi.mul_(group["gamma"]).add_(grad.square_(), alpha=1 - group["gamma"])
                     var_estimate = vi
                     
                 update = var_estimate.clamp_(min=eps1 * eps1).rsqrt_().mul_(grad)
-                  
-                update = update.div_(torch.norm(update, float('inf')).clamp_(min=eps1))
-                denom = max(1.0, update.norm(2).item() / ((update.numel() ** 0.5) * group["d"]))
-                param.add_(update.sign() * update.abs().max(dim=-1, keepdim=True)[0], alpha=-adaptive_lr / denom)
-            
+                inf_norm = torch.norm(update, float('inf'))
+                if inf_norm > 0:
+                    update.div_(inf_norm.clamp_(min=eps1))
+                
+                if group.get("clip", 0) > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [update], 
+                        max_norm=group["clip"])
+                
+                l2_norm = update.norm(2).item()
+                denom = max(1.0, l2_norm / ((update.numel() ** 0.5) * group["d"]))
+                if param.dim() > 1:
+                    param.add_(
+                        update.sign() * update.abs().max(dim=-1, keepdim=True)[0], 
+                        alpha=-adaptive_lr / denom)
+                else:
+                    param.add_(update, alpha=-adaptive_lr / denom)
                 state["step"] = step_t
-
         return loss
-
-token=""
-
+    
 extractor = WhisperFeatureExtractor.from_pretrained(
-    pretrained_model_name_or_path="openai/whisper-small", token=token,
-    feature_size=128, sampling_rate=16000, return_tensors="pt", do_normalize=True)
+    pretrained_model_name_or_path="openai/whisper-small", 
+    feature_size=128, sample_rate=16000, do_normalize=True)
 
 tokenizer = WhisperTokenizerFast.from_pretrained(
     pretrained_model_name_or_path="openai/whisper-small", 
-    language="en", task="transcribe", token=token)
+    language="en", task="transcribe")
 
 processor = WhisperProcessor.from_pretrained(
-    pretrained_model_name_or_path="openai/whisper-small", token=token)
-
-@dataclass
-class DataCollatorSpeechSeq2SeqWithPadding:
-    processor: Any
-    extractor: Any
-    tokenizer: Any
-    decoder_start_token_id: int
-
-    def __call__(self, features: List[Dict[str, Union[List[int], Tensor]]]) -> Dict[str, Tensor]:
-        input_features = [{"input_features": feature["input_features"]} for feature in features]
-        batch = self.extractor.pad(input_features, return_tensors="pt")
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
-        labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
-        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
-            labels = labels[:, 1:]
-        batch["labels"] = labels
-        return batch
+    pretrained_model_name_or_path="openai/whisper-small", 
+    feature_extractor=extractor,
+    tokenizer=tokenizer)
     
-def prepare_dataset(batch):
+def process_fn(batch):
+    return prepare_dataset(batch=batch, extractor=extractor, tokenizer=tokenizer)
+    
+def prepare_dataset(batch, extractor, tokenizer):
     audio = batch["audio"]
     batch["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
     batch["labels"] = tokenizer(batch["sentence"]).input_ids
     return batch
 
-data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-    processor=processor, extractor=extractor,
-    tokenizer=tokenizer, decoder_start_token_id=50258)
+def prepare_dataset_with_columns(batch, extractor, tokenizer):
+    result = {}
+    audio = batch["audio"]
+    result["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+    result["labels"] = tokenizer(batch["sentence"]).input_ids
+    return result
+    
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+    extractor: Any
+    tokenizer: Any
+    decoder_start_token_id=50258
+    pad_token_id=50257
 
-dataset = IterableDatasetDict()
-
-dataset["train"] = load_dataset(
-    path="mozilla-foundation/common_voice_17_0", split="train",
-    name="en", streaming=True, token=token, 
-    trust_remote_code=True, save_infos=True)#.shuffle()#.take(10000)
-
-dataset["test"] = load_dataset(
-    path="mozilla-foundation/common_voice_17_0",
-    name="en", split="test", streaming=True, 
-    token=token, trust_remote_code=True, save_infos=True).take(500)
-
-dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
-
-dataset = dataset.map(function=prepare_dataset, 
-    remove_columns=list(next(iter(dataset.values()))
-                        .features)).with_format(type="torch")
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        input_features = [{"input_features": feature["input_features"]} for feature in features]
+        batch = self.extractor.pad(input_features, return_tensors="pt")
+        
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        
+        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+            labels = labels[:, 1:]
+        
+        batch["labels"] = labels
+      
+        batch["input_ids"] = Echo.shift_tokens_right(
+            input_ids=labels,
+            pad_token_id=self.pad_token_id,
+            decoder_start_token_id=self.decoder_start_token_id
+        )
+        return batch
 
 metric = evaluate.load(path="wer")
 
-def compute_metrics(eval_pred):
-    pred_logits = eval_pred.predictions
-    label_ids = eval_pred.label_ids
-
-    if isinstance(pred_logits, tuple):
-        pred_ids = pred_logits[0]
-    else:
-        pred_ids = pred_logits
-    if pred_ids.ndim == 3:
-        pred_ids = np.argmax(pred_ids, axis=-1)
-
+def compute_metrics(pred, tokenizer):
+    pred_ids = pred["predictions"]
+    label_ids = pred["label_ids"]
     label_ids[label_ids == -100] = tokenizer.pad_token_id
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
     wer = 100 * metric.compute(predictions=pred_str, references=label_str) # type: ignore
-    pred_flat = pred_ids.flatten()
-    labels_flat = label_ids.flatten()
-    mask = labels_flat != tokenizer.pad_token_id
-  
-    if len(pred_str) > 0:
-        sample_idx = random.randint(0, len(pred_str) - 1)
-        print("-" * 10)
-        print(f"Prediction: {pred_str[sample_idx]}")
-        print(f"Label: {label_str[sample_idx]}")
-        print("-" * 10)
+    return {"wer": wer}
 
-    acc = accuracy_score(y_true=labels_flat[mask], y_pred=pred_flat[mask])
-    pre = precision_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
-    average='weighted', zero_division=0)
-    rec = recall_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
-    average='weighted', zero_division=0)
-    f1 = f1_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
-    average='weighted', zero_division=0)
+
+
+def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn, 
+                      max_steps=10000, device='cuda', accumulation_steps=1, clear_cache=True, 
+                      log_interval=10, eval_interval=100, save_interval=1000, 
+                      checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
+    model.to(device)
+    global_step = 0
+    scaler = GradScaler()
+    writer = SummaryWriter(log_dir=log_dir)
+    train_iterator = iter(train_loader)
+    total_loss = 0
+    step_in_report = 0
     
-    return {
-        "wer": wer,
-        "accuracy": acc,
-        "precision": pre,
-        "recall": rec,
-        "f1": f1}
+    progress_bar = tqdm(total=max_steps, desc="Training")
     
-log_dir = os.path.join(os.getcwd(), "whisper_training_logs")
-os.makedirs(log_dir, exist_ok=True)
+    model.train()
+    optimizer.zero_grad()
+    
+    while global_step < max_steps:
+        try:
+            batch = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(train_loader)
+            batch = next(train_iterator)
+            
+            if step_in_report > 0:
+                avg_loss = total_loss / step_in_report if step_in_report > 0 else 0
+                logging.info(f"Dataset iteration complete - Steps: {global_step}, Avg Loss: {avg_loss:.4f}")
+                total_loss = 0
+                step_in_report = 0
+        
+        start_time = time.time()
 
-args = Seq2SeqTrainingArguments(
-    output_dir=log_dir,
-    per_device_train_batch_size=1,
-    per_device_eval_batch_size=1,
-    gradient_accumulation_steps=1,
-    eval_accumulation_steps=1,
-    tf32=True,
-    bf16=True,
-    eval_strategy="steps",
-    save_strategy="steps",
-    max_steps=100000,
-    save_steps=1000,
-    eval_steps=1000,
-    warmup_steps=300,
-    num_train_epochs=1,
-    logging_steps=1,
-    logging_dir=os.path.join(log_dir, "logs_hf"),
-    report_to=["tensorboard"],
-    push_to_hub=False,
-    disable_tqdm=False,
-    save_total_limit=1,
-    remove_unused_columns=False,
-    label_names=["labels"],
-    eval_on_start=False,
-    # optim="adafactor",
-)
+        input_features = batch['input_features'].to(device)
+        input_ids = batch['input_ids'].to(device)
+        labels = batch['labels'].long().to(device)
+        
+        with torch.autocast(device_type='cuda'):
+            if global_step % 100 == 0:
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                    with record_function("model_training"):
+                        input_features_encoded = model.encoder(input_features)
+                        decoder_output = model.decoder(input_ids, input_features_encoded)
+            else:
+                input_features_encoded = model.encoder(input_features)
+                decoder_output = model.decoder(input_ids, input_features_encoded)
+        
+        logits = decoder_output.view(-1, decoder_output.size(-1))
+        loss = loss_fn(logits, labels.view(-1))
+        total_loss += loss.item()
+        loss = loss / accumulation_steps
 
-optimizer = MaxFactor(
-    model.parameters(), 
-    lr=0.01,  
-    beta2_decay=-0.8,
-    eps=(1e-10, 1e-4),  
-    d=1.0,
-    weight_decay=0.01,  
-    gamma=0.99,         
-    eps_rms=1e-8,
-    maximize=False,
-)
+        scaler.scale(loss).backward()
 
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer=optimizer,
-    T_max=args.max_steps,
-    eta_min=0.0,
-    last_epoch=-1  
-)
+        if (global_step + 1) % accumulation_steps == 0:
+            scaler.step(optimizer=optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
-trainer = Seq2SeqTrainer(
-    args=args,
-    model=model,
-    train_dataset=dataset["train"],
-    eval_dataset=dataset["test"],
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    processing_class=extractor,
-    optimizers=(optimizer, scheduler),
-)
+            if clear_cache:
+                torch.cuda.empty_cache()
+
+        end_time = time.time()
+        samples_per_sec = len(batch['input_features']) / (end_time - start_time)
+
+        if global_step % log_interval == 0:
+            writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (global_step + 1), global_step=global_step)
+            
+            lr = optimizer.param_groups[0].get('lr', None)
+            if lr is not None:
+                writer.add_scalar('LearningRate', scalar_value=lr, global_step=global_step)
+            else:
+                if not lr_warning_printed:
+                    print(f"Warning: Learning rate is None at step {global_step}")
+                    lr_warning_printed = True
+
+            writer.add_scalar(tag='SamplesPerSec', scalar_value=samples_per_sec, global_step=global_step)
+
+        if global_step % eval_interval == 0:
+            model.eval()
+            eval_start_time = time.time()
+            eval_loss = 0
+            all_predictions = []
+            all_labels = []
+            batch_count = 0
+            total_samples = 0
+            
+            with torch.no_grad():
+                for eval_batch in tqdm(eval_loader, desc=f"Evaluating (Step {global_step})", leave=False):
+                    input_features = eval_batch['input_features'].to(device)
+                    input_ids = eval_batch['input_ids'].to(device)
+                    labels = eval_batch['labels'].long().to(device)
+                    
+                    batch_size = input_features.size(0)
+                    total_samples += batch_size
+                    
+                    input_features_encoded = model.encoder(input_features)
+                    decoder_output = model.decoder(input_ids, input_features_encoded)
+                    logits = decoder_output.view(-1, decoder_output.size(-1))
+                    loss = loss_fn(logits, labels.view(-1))
+                    eval_loss += loss.item()
+                    all_predictions.extend(torch.argmax(decoder_output, dim=-1).cpu().numpy().tolist())
+                    all_labels.extend(labels.cpu().numpy().tolist())
+                    batch_count += 1
+
+            eval_time = time.time() - eval_start_time
+            eval_loss_avg = eval_loss / batch_count if batch_count > 0 else 0
+            predictions = {"predictions": np.array(all_predictions, dtype=object), "label_ids": np.array(all_labels, dtype=object)}
+            metrics = compute_metrics(pred=predictions, tokenizer=tokenizer)
+            
+            writer.add_scalar('Loss/eval', eval_loss_avg, global_step)
+            writer.add_scalar('WER', metrics['wer'], global_step)
+            writer.add_scalar('EvalSamples', total_samples, global_step)
+            writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
+            
+            lr = optimizer.param_groups[0].get('lr', 0)
+            
+            print("\n" + "="*80)
+            print(f"EVALUATION REPORT - STEP {global_step}")
+            print("="*80)
+            print(f"Metrics:")
+            print(f"  • Loss:               {eval_loss_avg:.4f}")
+            print(f"  • Word Error Rate:    {metrics['wer']:.2f}%")
+            print(f"  • Character Error Rate: {metrics.get('cer', 0):.2f}%")
+            print(f"Stats:")
+            print(f"  • Learning Rate:      {lr:.8f}")
+            print(f"  • Eval Batches:       {batch_count}")
+            print(f"  • Eval Samples:       {total_samples}")
+            print(f"  • Eval Time:          {eval_time:.2f}s ({total_samples/eval_time:.2f} samples/sec)")
+            print(f"  • Training Speed:     {samples_per_sec:.2f} samples/sec")
+            
+            if len(all_predictions) > 0:
+                print("\nSample Predictions:")
+                sample_indices = range(min(3, len(all_predictions)))
+                for idx in sample_indices:
+                    pred_str = tokenizer.decode(all_predictions[idx], skip_special_tokens=True)
+                    label_str = tokenizer.decode(all_labels[idx], skip_special_tokens=True)
+                    print(f"  Example {idx+1}:")
+                    print(f"    • Reference: {label_str}")
+                    print(f"    • Prediction: {pred_str}")
+            print("="*80 + "\n")
+            
+            logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {eval_loss_avg:.4f}, LR: {lr:.8f}")
+            scheduler.step()
+            model.train()
+
+        if global_step % save_interval == 0:
+            checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{global_step}.pt')
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"Model saved at step {global_step} to {checkpoint_path}")
+            logging.info(f"Model saved at step {global_step} to {checkpoint_path}")
+
+        global_step += 1
+        step_in_report += 1
+        progress_bar.update(1)
+        
+    final_model_path = os.path.join(checkpoint_dir, 'final_model.pt')
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Training completed after {global_step} steps. Final model saved to {final_model_path}")
+    writer.close()
+    progress_bar.close()
 
 
-trainer.train(resume_from_checkpoint=False)
+if __name__ == "__main__":
 
+    checkpoint_dir = './newproject/test/'
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    log_dir = os.path.join("./output/Whisper", datetime.now().strftime(format="%m-%d_%H"))
+    os.makedirs(name=log_dir, exist_ok=True)
 
+    logging.basicConfig(
+        filename=os.path.join(log_dir, 'training.log'), filemode='w', format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+    token=""
+
+    extractor = WhisperFeatureExtractor.from_pretrained(
+        pretrained_model_name_or_path="openai/whisper-small", 
+        feature_size=128, sample_rate=16000, do_normalize=True)
+
+    tokenizer = WhisperTokenizerFast.from_pretrained(
+        pretrained_model_name_or_path="openai/whisper-small", 
+        language="en", task="transcribe")
+
+    processor = WhisperProcessor.from_pretrained(
+        pretrained_model_name_or_path="openai/whisper-small", 
+        feature_extractor=extractor,
+        tokenizer=tokenizer)
+
+    dataset = IterableDatasetDict()
+
+    dataset["train"] = load_dataset(
+        path="mozilla-foundation/common_voice_17_0", split="train",
+        name="en", streaming=True, token=token, 
+        trust_remote_code=True)#.shuffle()#.take(10000)
+
+    dataset["test"] = load_dataset(
+        path="mozilla-foundation/common_voice_17_0",
+        name="en", split="test", streaming=True, 
+        token=token, trust_remote_code=True).take(500) # type: ignore
+    
+    dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
+    dataset = dataset.map(function=process_fn).with_format(type="torch")                       
+    dataset = dataset.select_columns(column_names=["labels", "input_features"])
+
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+        processor=processor, extractor=extractor,
+        tokenizer=tokenizer)
+
+    train_dataloader = DataLoader(
+        dataset=dataset["train"], 
+        batch_size=1, 
+        collate_fn=data_collator,
+        num_workers=0 )
+
+    eval_dataloader = DataLoader(
+        dataset=dataset["test"],
+        batch_size=1,
+        collate_fn=data_collator,
+        num_workers=0 )
+    
+    param = Dimensions(
+        mels=128,
+        audio_ctx=1500,
+        audio_head=4,
+        audio_layerA=4,
+        audio_layerB=0,
+        audio_state=1024,
+        vocab=51865,
+        text_ctx=448,
+        text_head=4,
+        text_layerA=4,
+        text_layerB=0,
+        text_state=1024,
+        checkpoint=False,
+        dropout=0.001,
+        activation="gelu",
+    )
+
+    model = Echo(param=param).to(device=device)
+    model.init_weights()
+
+    optimizer = MaxFactor(params=model.parameters())
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=100000, eta_min=0)
+    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+    train_and_evaluate(model=model, 
+        tokenizer=tokenizer, 
+        train_loader=train_dataloader, 
+        eval_loader=eval_dataloader, 
+        optimizer=optimizer, 
+        scheduler=scheduler, 
+        loss_fn=loss_fn, 
+        max_steps=100,
+        device='cuda', 
+        accumulation_steps=1, 
+        clear_cache=True, 
+        log_interval=1, 
+        eval_interval=10, 
+        save_interval=100, 
+        checkpoint_dir=checkpoint_dir, 
+        log_dir=log_dir
+        )
 
 
 
