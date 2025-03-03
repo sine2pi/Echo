@@ -40,18 +40,6 @@ dtype = torch.float32
 torch.set_default_dtype(dtype)
 
 
-# from torch.utils.cpp_extension import load
-
-# custom_ops = load(
-#     name="custom_asr_ops",
-#     sources=["maxfactor_op.cpp", "collator.cpp"],
-#     extra_cflags=["-O3"],
-#     with_cuda=True
-# )
-
-
-
-
 @dataclass
 class Dimensions: # type: ignore
     
