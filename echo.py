@@ -1,11 +1,17 @@
 
-import base64, os, evaluate, random, gzip, math, torch, numpy as np, json, warnings
+import base64, os, evaluate, random, gzip, math, torch, numpy as np, json, warnings, time
 from sklearn.metrics import accuracy_score, precision_score, f1_score, recall_score
+from sklearn.model_selection import train_test_split
 from datasets import load_dataset, IterableDatasetDict, Audio
 from transformers import (Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperProcessor,WhisperFeatureExtractor,
 WhisperTokenizerFast)
+import gc
 import torch.nn.functional as F
+import logging
+from torch.profiler import profile, ProfilerActivity, record_function
 import transformers
+from safetensors import safe_open
+from torch.amp.grad_scaler import GradScaler
 from itertools import chain
 from torch.utils.checkpoint import checkpoint
 from typing import Dict, Optional, Tuple
@@ -13,6 +19,18 @@ from torch import Tensor, nn
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union, List, Any
 from torch.nn.functional import scaled_dot_product_attention
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+import torchaudio.transforms as transforms
+import torch
+import csv
+import numpy as np
+import whisper
+from torch.utils.tensorboard.writer import SummaryWriter
+from datetime import datetime
+from torch.utils.data import Subset
+import os, random
+from tqdm import tqdm
 
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -22,8 +40,21 @@ dtype = torch.float32
 torch.set_default_dtype(dtype)
 
 
+# from torch.utils.cpp_extension import load
+
+# custom_ops = load(
+#     name="custom_asr_ops",
+#     sources=["maxfactor_op.cpp", "collator.cpp"],
+#     extra_cflags=["-O3"],
+#     with_cuda=True
+# )
+
+
+
+
 @dataclass
-class Dimensions:
+class Dimensions: # type: ignore
+    
     mels: int
     audio_ctx: int
     audio_state: int
@@ -45,7 +76,6 @@ class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
         return super().forward(input=x.float()).type(dtype=x.dtype)
 
-
 class Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(
@@ -53,7 +83,6 @@ class Linear(nn.Linear):
             weight=self.weight.to(dtype=x.dtype),
             bias=None if self.bias is None else self.bias.to(dtype=x.dtype),
         )
-
 
 class Conv1d(nn.Conv1d):
     def _conv_forward(
@@ -66,139 +95,17 @@ class Conv1d(nn.Conv1d):
         )
 
 
-# @torch.jit.script
-# def _apply_qrotation(x: torch.Tensor, theta: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-#     u = u / torch.norm(u)
-#     v = v / torch.norm(v)
-
-#     half_theta = theta / 2
-#     cos_ht = torch.cos(half_theta)
-#     sin_ht = torch.sin(half_theta)
-
-#     q = torch.cat([cos_ht.unsqueeze(0), sin_ht * u])
-    
-#     x_shape = x.shape
-#     x = x.view(-1, 3)
-
-#     uv_cross = torch.cross(u.unsqueeze(0), x)
-#     uuv_cross = torch.cross(u.unsqueeze(0), uv_cross)
-#     x_rot = x + 2 * (q[0] * uv_cross + uuv_cross)
-
-#     x_rot = x_rot.view(*x_shape)
-#     return x_rot
-
-# @torch.jit.script
-# def _create_rotation_matrix(dims: int, i: int, j: int, theta: torch.Tensor, device: torch.device) -> torch.Tensor:
-#     G = torch.eye(dims, device=device)
-#     c, s = torch.cos(theta), torch.sin(theta)
-#     G[i, i], G[j, j] = c, c
-#     G[i, j], G[j, i] = -s, s
-    
-#     if dims == 3:
-#         u = torch.eye(dims, device=device)[i]
-#         v = torch.eye(dims, device=device)[j]
-#         x = torch.eye(dims, device=device)
-        
-#         Q = _apply_qrotation(x, theta=theta, u=u, v=v)
-#         G = (G + Q) / 2
-#     return G
-
-# @torch.jit.script
-# def _apply_rope_transform(
-#     x: torch.Tensor, 
-#     sin: torch.Tensor, 
-#     cos: torch.Tensor
-# ) -> torch.Tensor:
-#     x1, x2 = x[..., ::2], x[..., 1::2]
-#     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-
-
-# class rotary2(nn.Module):
-#     def __init__(self, ctx, dims, heads, base=10000, theta_learnable=False,
-#         rot_learnable=False, matrix_learnable=False, freq_learnable=False,
-#     ):
-#         super().__init__()
-#         self.ctx = ctx
-#         self.dims = dims
-#         self.heads = heads
-#         self.base = base
-
-#         self.head_dim = self.dims // self.heads
-#         self.rot = self.head_dim // 2
-
-#         self.thetas = nn.Parameter(torch.zeros(self.rot))
-#         self.r_pairs = nn.Parameter(torch.rand(self.rot, 2) * self.head_dim)
-#         self.theta_scale = nn.Parameter(torch.ones(1), requires_grad=theta_learnable)
-#         self.rot_scale = nn.Parameter(torch.ones(1), requires_grad=rot_learnable)
-#         self.r_matrix = nn.Parameter(
-#             torch.eye(self.head_dim), requires_grad=matrix_learnable
-#         )
-
-#         freq_data = 1.0 / (
-#             self.base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
-#         )
-
-#         self.inv_freq = nn.Parameter(freq_data, requires_grad=freq_learnable)
-
-#         self.reset_parameters()
-
-#     def reset_parameters(self):
-#         nn.init.orthogonal_(self.r_matrix)
-#         nn.init.zeros_(self.thetas)
-
-#     def q_rotation(self, x, theta, u, v):
-#         return _apply_qrotation(x, theta, u, v)
-
-#     def rotation_matrix(self, dims, i, j, theta):
-#         return _create_rotation_matrix(dims, i, j, theta, theta.device)
-
-#     @torch.jit.script_method # type: ignore
-#     def apply_rotations(self, x: torch.Tensor) -> torch.Tensor:
-#         adjusted_rot = int(self.rot_scale.item() * self.rot)
-#         for k in range(adjusted_rot):
-#             i, j = int(self.r_pairs[k, 0].item()), int(self.r_pairs[k, 1].item())
-#             theta = self.thetas[k] * self.theta_scale
-#             G = _create_rotation_matrix(self.head_dim, i, j, theta, x.device)
-#             x = x @ G
-#         return x
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         batch_size, seq_len = x.shape[0], x.shape[1]
-        
-#         if x.dim() == 3:
-#             if x.shape[2] != self.dims:
-#                 raise ValueError(f"Expected dim {self.dims}, got {x.shape[2]}")
-#             x = x.view(batch_size, seq_len, self.heads, self.head_dim)
-#         elif x.dim() == 4:
-#             if x.shape[2] != self.heads or x.shape[3] != self.head_dim:
-#                 raise ValueError(f"Expected {self.heads} heads and {self.head_dim} head_dim")
-#         else:
-#             raise ValueError(f"Expected 3D or 4D input, got {x.dim()}D")
-
-#         x_flat = x.reshape(-1, self.head_dim)
-#         x_rotated = self.apply_rotations(x_flat)
-#         x_rotated = x_rotated @ self.r_matrix
-        
-#         x = x_rotated.view(batch_size, seq_len, self.heads, self.head_dim)
-        
-#         position = torch.arange(seq_len, device=x.device, dtype=x.dtype).unsqueeze(1)
-#         div_term = self.inv_freq.unsqueeze(0)
-#         sinusoid_inp = position * div_term
-        
-#         sin = torch.sin(sinusoid_inp).unsqueeze(0).unsqueeze(2)
-#         cos = torch.cos(sinusoid_inp).unsqueeze(0).unsqueeze(2)
-        
-#         x = _apply_rope_transform(x, sin, cos)
-        
-#         x = x.view(batch_size, seq_len, self.dims)
-#         x = x * math.sqrt(self.dims)
-#         return x
-
-
 class rotary(nn.Module):
     def __init__(self, ctx, dims, heads, base=10000, theta_learnable=False,
         rot_learnable=False, matrix_learnable=False, freq_learnable=False,
+        debug=False
     ):
+        
+        if debug == True:
+            print(f"Rotary check: {ctx} {dims} {heads} {base} {theta_learnable} {rot_learnable} "
+                  f"{matrix_learnable} {freq_learnable}")
+
+        
         super().__init__()
         self.ctx = ctx
         self.dims = dims
@@ -212,14 +119,9 @@ class rotary(nn.Module):
         self.r_pairs = nn.Parameter(torch.rand(self.rot, 2) * self.head_dim)
         self.theta_scale = nn.Parameter(torch.ones(1), requires_grad=theta_learnable)
         self.rot_scale = nn.Parameter(torch.ones(1), requires_grad=rot_learnable)
-        self.r_matrix = nn.Parameter(
-            torch.eye(self.head_dim), requires_grad=matrix_learnable
-        )
+        self.r_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=matrix_learnable)
 
-        freq_data = 1.0 / (
-            self.base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
-        )
-
+        freq_data = 1.0 / (self.base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         self.inv_freq = nn.Parameter(freq_data, requires_grad=freq_learnable)
 
         self.reset_parameters()
@@ -259,8 +161,7 @@ class rotary(nn.Module):
             u = torch.eye(dims, device=theta.device)[i]
             v = torch.eye(dims, device=theta.device)[j]
             Q = self.q_rotation(
-                torch.eye(dims, device=theta.device), theta=theta, u=u, v=v
-            )
+                torch.eye(dims, device=theta.device), theta=theta, u=u, v=v)
             G = (G + Q) / 2
         return G
 
@@ -310,9 +211,7 @@ class rotary(nn.Module):
         x = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
         x = x.view(batch_size, seq_len, self.dims)
         x = x * math.sqrt(self.dims)
-
         return x
-
 
 class PositionalEncoding(nn.Module):
     def __init__(self, dims, ctx):
@@ -338,9 +237,7 @@ class PositionalEncoding(nn.Module):
         pe = self.pe[:, :seq_len, :]
         x = x * math.sqrt(self.dims)
         x = x + pe
-
         return x
-
 
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
@@ -351,22 +248,15 @@ def sinusoids(length, channels, max_timescale=10000):
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 
-# @torch.jit.script
-# def _manual_attention(q: Tensor, k: Tensor, v: Tensor,  scale: float,
-#     mask: Optional[Tensor] = None,  ctx: int = 0, k_ctx: int = 0
-# ) -> Tuple[Tensor, Tensor]:
-#     qk = (q * scale) @ ((k * scale).transpose(-1, -2))
-#     if mask is not None:
-#         qk = qk + mask[:ctx, :k_ctx]
-#     qk_float = qk.float()
-#     w = F.softmax(qk_float, dim=-1).to(q.dtype)
-#     out = (w @ v)
-#     return out, qk_float
 
 class MultiheadA(nn.Module):
     use_sdpa: bool = True
 
-    def __init__(self, dims: int, heads: int):
+    def __init__(self, dims: int, heads: int, debug=False):
+        
+        if debug == True:
+            print(f"MultiheadA check: {dims} {heads}")
+        
         super().__init__()
 
         assert dims % heads == 0, f"dims ({dims}) must be divisible by heads ({heads})"
@@ -384,23 +274,19 @@ class MultiheadA(nn.Module):
         self.value = nn.Linear(in_features=dims, out_features=dims)
         self.out = nn.Linear(in_features=dims, out_features=dims)
 
-        self._init_weights()
+        self.init_weights()
 
-        self.register_buffer("_has_cuda", torch.tensor(torch.cuda.is_available()))
-
-    def _init_weights(self):
-
-        std = 0.02
-        nn.init.normal_(self.query.weight, std=std)
-        nn.init.normal_(self.key.weight, std=std)
-        nn.init.normal_(self.value.weight, std=std)
-        nn.init.normal_(self.out.weight, std=std)
+    def init_weights(self):
+        nn.init.normal_(tensor=self.query.weight, std=0.02)
+        nn.init.normal_(tensor=self.key.weight, std=0.02)
+        nn.init.normal_(tensor=self.value.weight, std=0.02)
+        nn.init.normal_(tensor=self.out.weight, std=0.02)
         if self.query.bias is not None:
-            nn.init.zeros_(self.query.bias)
+            nn.init.zeros_(tensor=self.query.bias)
         if self.value.bias is not None:
-            nn.init.zeros_(self.value.bias)
+            nn.init.zeros_(tensor=self.value.bias)
         if self.out.bias is not None:
-            nn.init.zeros_(self.out.bias)
+            nn.init.zeros_(tensor=self.out.bias)
 
     def forward(
         self,
@@ -438,44 +324,39 @@ class MultiheadA(nn.Module):
 
     def _attention(
         self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
-
-        batch, ctx, _ = q.shape
-        k_ctx = k.size(1)
-
-        head_dim = self.dims // self.heads
-        reshape_dim = (batch, -1, self.heads, head_dim)
-
-        q = q.view(*reshape_dim).transpose(1, 2)
-        k = k.view(batch, k_ctx, self.heads, head_dim).transpose(1, 2)
-        v = v.view(batch, k_ctx, self.heads, head_dim).transpose(1, 2)
+        
+        batch, ctx, dims = q.shape
+        scale = (dims // self.heads) ** -0.25
+        q = q.view(*q.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
+        k = k.view(*k.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
+        v = v.view(*v.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
 
         if MultiheadA.use_sdpa:
-            with torch.autocast(device_type="cuda", enabled=True):
-                out = F.scaled_dot_product_attention(
-                    query=q,
-                    key=k,
-                    value=v,
-                    attn_mask=None,
-                    is_causal=mask is not None and ctx > 1,
-                )
-            out = out.transpose(1, 2).flatten(2)
-            return out, None
+            a = scaled_dot_product_attention(query=q, key=k, value=v, is_causal=mask is not None and ctx > 1)
+            out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+            qk = None
         else:
-            qk = (q * self.scale) @ ((k * self.scale).transpose(-1, -2))
+            qk = (q * scale) @ (k * scale).transpose(-1, -2)
             if mask is not None:
-                qk = qk + mask[:ctx, :k_ctx]
-            qk_float = qk.float()
-            w = F.softmax(qk_float, dim=-1).to(q.dtype)
-            out = (w @ v).transpose(1, 2).flatten(2)
-            print("mulita",out.shape)
-            return out, qk_float.detach()
+                qk = qk + mask[:ctx, :ctx]
+            qk = qk.float()
+
+            w = F.softmax(qk, dim=-1).to(dtype=q.dtype)
+            out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
+            qk = qk.detach()
+
+        return out, qk
 
 
-class MultiHeadB(nn.Module):
+class MultiheadB(nn.Module):
 
     use_sdpa: bool = True
 
-    def __init__(self, dims: int, heads: int):
+    def __init__(self, dims: int, heads: int, debug=False):
+        
+        if debug == True:
+            print(f"MultiheadB check: {dims} {heads}")
+        
         super().__init__()
 
         if dims % heads != 0:
@@ -493,16 +374,16 @@ class MultiHeadB(nn.Module):
         self.out = Linear(in_features=dims, out_features=dims)
 
     def init_weights(self):
-        nn.init.normal_(self.query.weight, std=0.02)
-        nn.init.normal_(self.key.weight, std=0.02)
-        nn.init.normal_(self.value.weight, std=0.02)
-        nn.init.normal_(self.out.weight, std=0.02)
+        nn.init.normal_(tensor=self.query.weight, std=0.02)
+        nn.init.normal_(tensor=self.key.weight, std=0.02)
+        nn.init.normal_(tensor=self.value.weight, std=0.02)
+        nn.init.normal_(tensor=self.out.weight, std=0.02)
         if self.query.bias is not None:
-            nn.init.zeros_(self.query.bias)
+            nn.init.zeros_(tensor=self.query.bias)
         if self.value.bias is not None:
-            nn.init.zeros_(self.value.bias)
+            nn.init.zeros_(tensor=self.value.bias)
         if self.out.bias is not None:
-            nn.init.zeros_(self.out.bias)
+            nn.init.zeros_(tensor=self.out.bias)
 
     def forward(
         self,
@@ -526,39 +407,29 @@ class MultiHeadB(nn.Module):
             k = kv_cache[self.key]
             v = kv_cache[self.value]
 
-        wv, qk = self.qkv_attention(q=q, k=k, v=v, mask=mask)
+        wv, qk = self._attention(q=q, k=k, v=v, mask=mask)
         return self.out(wv), qk
 
-    def qkv_attention(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
-
+    def _attention(
+        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
+        
         batch, ctx, dims = q.shape
         scale = (dims // self.heads) ** -0.25
+        q = q.view(*q.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
+        k = k.view(*k.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
+        v = v.view(*v.shape[:2], self.heads, -1).permute(0, 2, 1, 3)
 
-        q = q.view(batch, ctx, self.heads, -1).permute(0, 2, 1, 3)
-        k = k.view(batch, k.size(1), self.heads, -1).permute(0, 2, 1, 3)
-        v = v.view(batch, v.size(1), self.heads, -1).permute(0, 2, 1, 3)
-
-        if self.use_sdpa and torch.cuda.is_available():
-            with torch.autocast("cuda"):
-                a = scaled_dot_product_attention(
-                    query=q, key=k, value=v, is_causal=mask is not None and ctx > 1
-                )
+        if MultiheadA.use_sdpa:
+            a = scaled_dot_product_attention(query=q, key=k, value=v, is_causal=mask is not None and ctx > 1)
             out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = None
         else:
-
             qk = (q * scale) @ (k * scale).transpose(-1, -2)
             if mask is not None:
                 qk = qk + mask[:ctx, :ctx]
             qk = qk.float()
 
-            w = F.softmax(qk, dim=-1).to(q.dtype)
+            w = F.softmax(qk, dim=-1).to(dtype=q.dtype)
             out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = qk.detach()
 
@@ -567,7 +438,11 @@ class MultiHeadB(nn.Module):
 class MultiheadC(nn.Module):
     use_sdpa: bool = True
 
-    def __init__(self, dims: int, heads: int, max_dist: int):
+    def __init__(self, dims: int, heads: int, max_dist: int, debug=False):
+        
+        if debug == True:
+            print(f"MultiheadC check: {dims} {heads} {max_dist}")
+        
         super().__init__()
         if dims % heads != 0:
             raise ValueError(f"dims ({dims}) must be divisible by heads ({heads})")
@@ -606,10 +481,10 @@ class MultiheadC(nn.Module):
             k = kv_cache[self.key]
             v = kv_cache[self.value]
 
-        wv, qk = self.qkv_attention(q=q, k=k, v=v, mask=mask)
+        wv, qk = self._attention(q=q, k=k, v=v, mask=mask)
         return self.out(wv), qk
 
-    def qkv_attention(
+    def _attention(
         self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
     ) -> Tuple[Tensor, Optional[Tensor]]:
 
@@ -715,7 +590,11 @@ class Predictor(nn.Module):
         return scale
 
 class AdaptiveSpan(nn.Module):
-    def __init__(self, dims, heads, max_dist, sharpen=True, temp_scale=0.01):
+    def __init__(self, dims, heads, max_dist, sharpen=True, temp_scale=0.01, debug=False):
+        
+        if debug == True:
+            print(f"AdaptiveSpan check: {dims} {heads} {max_dist} {sharpen} {temp_scale}")
+        
         super().__init__()
         self.heads = heads
         self.max_dist = max_dist
@@ -761,14 +640,18 @@ class AdaptiveSpan(nn.Module):
                 else 0.5 + self.temp_scale * span_mean
             )
             scores = torch.matmul(q, k.transpose(-2, -1))
-            weights = torch.softmax((scores / temperature) * self.scale, dim=-1)
+            weights = torch.softmax((scores / temperature) * self.scale, dim=-1) # type: ignore
             out = torch.matmul(weights, v)
             out = out.permute(0, 2, 1, 3).reshape(batch_size, eff_span, self.dims)
 
         return out, weights
 
 class FocusA(nn.Module):
-    def __init__(self, dims, heads, max_dist, sharpen=True, win_size=256, max_span=512):
+    def __init__(self, dims, heads, max_dist, sharpen=True, win_size=256, max_span=512, debug=False):
+        
+        if debug == True:
+            print(f"FocusA check: {dims} {heads} {max_dist} {sharpen} {win_size} {max_span}")
+        
         super().__init__()
         self.heads = heads
         self.max_dist = max_dist
@@ -881,8 +764,8 @@ class FocusA(nn.Module):
         attn_out = torch.zeros_like(input=query)
         attn_weights = None
 
-        threshold = self.threshold.item()
-        s_factor = self.s_factor.item()
+        threshold = self.threshold.item()# type: ignore
+        s_factor = self.s_factor.item()# type: ignore
 
         while iteration < max_iterations:
             span_len = int(self.max_span * span_scale.mean().item())
@@ -1016,8 +899,11 @@ class FocusA(nn.Module):
 
 class Residual(nn.Module):
     def __init__(
-        self, param: Dimensions, dims: int, heads: int, dropout: float, activation: str
+        self, param: Dimensions, dims: int, heads: int, dropout: float, activation: str, debug=False
     ):
+        if debug == True:
+            print(f"Residual check: {param} {dims} {heads} {dropout} {activation}")
+        
         super().__init__()
         self.param = param
         self.dims = dims
@@ -1033,26 +919,26 @@ class Residual(nn.Module):
         act_fn = activation_map.get(activation, nn.ReLU())
 
         self.attn = MultiheadA(dims=dims, heads=heads)
-        self.cross = MultiHeadB(dims=dims, heads=heads)
+        self.cross = MultiheadB(dims=dims, heads=heads)
 
         self.mlp = nn.Sequential(
             nn.Dropout(p=dropout),
-            nn.Linear(in_features=dims, out_features=dims * 4, bias=True),
+            Linear(in_features=dims, out_features=dims * 4, bias=True),
             act_fn,
             nn.Dropout(p=dropout),
-            nn.Linear(in_features=dims * 4, out_features=dims, bias=True),
+            Linear(in_features=dims * 4, out_features=dims, bias=True),
         )
 
-        self.ln_a = nn.LayerNorm(normalized_shape=dims)
-        self.ln_b = nn.LayerNorm(normalized_shape=dims)
-        self.ln_c = nn.LayerNorm(normalized_shape=dims)
+        self.ln_a = LayerNorm(normalized_shape=dims)
+        self.ln_b = LayerNorm(normalized_shape=dims)
+        self.ln_c = LayerNorm(normalized_shape=dims)
 
-        self._init_weights()
+        self.init_weights()
 
-    def _init_weights(self):
+    def init_weights(self):
 
         for m in self.mlp:
-            if isinstance(m, nn.Linear):
+            if isinstance(m, Linear):
                 nn.init.kaiming_normal_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -1072,12 +958,15 @@ class Residual(nn.Module):
             z = self.ln_b(x)
             x = x + self.cross(z, xa, mask=mask, kv_cache=kv_cache)[0]
         x = x + self.mlp(self.ln_c(x))
-
         return x + y
     
 class AudioEncoder(nn.Module):
     def __init__(self, param: Dimensions, mels: int, ctx: int, dims: int, heads: int, 
-                checkpoint: bool, dropout: float, activation: str, layerA: int, layerB: int):
+                checkpoint: bool, dropout: float, activation: str, layerA: int, layerB: int, debug=False):
+        
+        if debug == True:
+            print(f"AudioEncoder check: {param} {mels} {ctx} {dims} {heads} {checkpoint} {dropout} {activation} {layerA} {layerB}")
+        
         super().__init__()
         
         self.checkpoint = checkpoint
@@ -1097,18 +986,18 @@ class AudioEncoder(nn.Module):
         self.register_buffer("positions", self.position, persistent=False)
 
         self.convx = nn.Sequential(
-            nn.Conv1d(mels, dims, kernel_size=3, padding=1, bias=False),
+            Conv1d(mels, dims, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm1d(dims),
             act,
             nn.Dropout(p=dropout),
-            nn.Conv1d(dims, dims, kernel_size=3, stride=2, padding=1, bias=False),
+            Conv1d(dims, dims, kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm1d(dims),
             act,
             nn.Dropout(p=dropout),
         )
 
         for m in self.convx:
-            if isinstance(m, nn.Conv1d):
+            if isinstance(m, Conv1d):
                 nn.init.kaiming_normal_(m.weight)
 
         self.blockA = nn.ModuleList([
@@ -1119,7 +1008,7 @@ class AudioEncoder(nn.Module):
             FocusA(dims=dims, heads=heads, max_dist=ctx) 
             for _ in range(layerB)]) if layerB > 0 else None
 
-        self.ln_post = nn.LayerNorm(dims)
+        self.ln_post = LayerNorm(dims)
 
     def forward(self, x) -> Tensor:
         x = checkpoint(self._forward, x, use_reentrant=True) if self.checkpoint else self._forward(x)
@@ -1136,7 +1025,11 @@ class AudioEncoder(nn.Module):
 
 class TextDecoder(nn.Module):
     def __init__(self, param: Dimensions, vocab: int, ctx: int, dims: int, heads: int, 
-                checkpoint: bool, dropout: float, activation: str, layerA: int, layerB: int):
+                checkpoint: bool, dropout: float, activation: str, layerA: int, layerB: int, debug=False):
+        
+        if debug == True:
+            print(f"TextDecoder check: {param} {vocab} {ctx} {dims} {heads} {checkpoint} {dropout} {activation} {layerA} {layerB}")
+        
         super().__init__()
         
         self.checkpoint = checkpoint
@@ -1194,20 +1087,56 @@ class Dimensions:
     dropout: float = 0.1
     activation: str = "gelu"
 
+
+    @classmethod
+    def from_dict(cls, param: dict):
+        return cls(
+            vocab=param.get("vocab_size", 51865),
+            text_ctx=param.get("text_ctx", 448),
+            text_state=param.get("hidden_size", 768),
+            text_head=param.get("num_attention_heads", 12),
+            text_layerA=param.get("num_hidden_layers", 12),
+            text_layerB=param.get("text_layerB", 0),
+            audio_ctx=param.get("audio_ctx", 1500),
+            audio_state=param.get("audio_state", 768),
+            audio_head=param.get("audio_head", 12),
+            audio_layerA=param.get("num_encoder_layers", 12),
+            audio_layerB=param.get("audio_layerB", 0),
+            mels=param.get("mels", 80),
+            checkpoint=param.get("checkpoint", False),
+            dropout=param.get("dropout", 0.01),
+            activation=param.get("activation", "gelu"),
+
+        )
+
+    def to_dict(self):
+        return {
+            "vocab_size": self.vocab,
+            "text_ctx": self.text_ctx,
+            "hidden_size": self.text_state,
+            "num_attention_heads": self.text_head,
+            "num_hidden_layers": self.text_layerA,
+            "audio_ctx": self.audio_ctx,
+            "audio_state": self.audio_state,
+            "audio_head": self.audio_head,
+            "num_encoder_layers": self.audio_layerA,
+            "mels": self.mels,
+            "checkpoint": self.checkpoint,
+            "dropout": self.dropout,
+            "activation": self.activation,
+
+        }
+
 class Echo(nn.Module):
 
-    PAD_TOKEN_ID = 50257
-    START_TOKEN_ID = 50258
-
-    def __init__(self, param: Dimensions):
+    def __init__(self, param: Dimensions, debug=False):
+        
+        if debug == True:
+            print(f"Echo check: {param}")
+        
         super().__init__()
         self.param = param
-
-        self._build_model()
-
         self.to(self.device)
-
-    def _build_model(self):
 
         self.encoder = AudioEncoder(
             param=self.param,
@@ -1235,6 +1164,9 @@ class Echo(nn.Module):
             activation=self.param.activation,
         )
 
+        self.PAD_TOKEN_ID = 50257
+        self.START_TOKEN_ID = 50258
+
     @property
     def device(self) -> torch.device:
 
@@ -1243,57 +1175,146 @@ class Echo(nn.Module):
     @staticmethod
     def shift_tokens_right(
         input_ids: torch.Tensor,
-        pad_token_id: int = PAD_TOKEN_ID,
-        decoder_start_token_id: int = START_TOKEN_ID,
+        pad_token_id = 50257,
+        decoder_start_token_id: int = 50258,
     ) -> torch.Tensor:
+        """ Shift input tokens right for teacher forcing. Returns: Shifted input tokens """
         batch_size, seq_len = input_ids.shape
         shifted_input_ids = torch.zeros_like(input_ids)
         shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
         shifted_input_ids[:, 0] = decoder_start_token_id
         shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
         return shifted_input_ids
-
+    
     def forward(
         self,
         input_features: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
-        dec_input_ids: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        auto_shift: bool = False,  # Shift input ids right for teacher forcing
     ) -> Dict[str, Optional[torch.Tensor]]:
-
-        if labels is not None and dec_input_ids is None:
-            dec_input_ids = self.shift_tokens_right(
+        
+        decoder_input_ids = input_ids
+        if auto_shift and labels is not None and decoder_input_ids is None:
+            decoder_input_ids = self.shift_tokens_right(
                 input_ids=labels,
                 pad_token_id=self.PAD_TOKEN_ID,
                 decoder_start_token_id=self.START_TOKEN_ID,
             )
-
+        
         with torch.autocast(device_type="cuda", enabled=torch.cuda.is_available()):
             encoded_features = self.encoder(input_features)
-
-            logits = self.decoder(dec_input_ids, encoded_features)
-
+            logits = self.decoder(decoder_input_ids, encoded_features)
+        
         loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             labels = labels.to(logits.device).long()
-
+            
             flattened_logits = logits.view(-1, self.param.vocab)
             flattened_labels = labels.view(-1)
-
+            
             loss = loss_fct(flattened_logits, flattened_labels)
-
+        
         return {"loss": loss, "logits": logits}
+            
+    def save_pretrained(self, save_directory: str, save_config: bool = True, safe_serialization: bool = False):
+
+        if os.path.isfile(save_directory):
+            raise AssertionError(f"Provided path ({save_directory}) should be a directory, not a file")
+        os.makedirs(save_directory, exist_ok=True)
+        weights_file = os.path.join(save_directory, "pytorch_model.bin")
+        if safe_serialization:
+            try:
+                from safetensors.torch import save_file as safe_save_file
+                state_dict = self.state_dict()
+                safe_save_file(state_dict, weights_file.replace(".bin", ".safetensors"))
+            except ImportError:
+                warnings.warn("safetensors not found. Falling back to torch.save")
+                torch.save(self.state_dict(), weights_file)
+        else:
+            torch.save(self.state_dict(), weights_file)
+
+        if save_config:
+            config_dict = {
+                "model_config": self.param.to_dict(),
+                "architectures": [self.__class__.__name__],
+                "model_type": "Echo",
+                "vocab_size": self.param.vocab,
+                "decoder_dims": self.param.text_state,
+                "encoder_dims": self.param.audio_state,
+                "decoder_attention_heads": self.param.text_head,
+                "encoder_attention_heads": self.param.audio_head,   
+                "encoder_layers": self.param.audio_layerA,
+                "decoder_layers": self.param.text_layerA,
+                "dropout": self.param.dropout,
+                
+            }
+
+            config_file = os.path.join(save_directory, "param.json")
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(config_dict, f, indent=2, sort_keys=True)
+   
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        device_map: Optional[str] = None,
+        torch_dtype: Optional[torch.dtype] = None,
+        force_cpu: bool = False
+    ) -> "Echo":
+
+        if os.path.isfile(pretrained_model_name_or_path):
+            raise ValueError(f"Provided path ({pretrained_model_name_or_path}) should be a directory, not a file")
+
+        config_file = os.path.join(pretrained_model_name_or_path, "param.json")
+        if not os.path.exists(config_file):
+            raise ValueError(f"Config file not found in {pretrained_model_name_or_path}")
+
+        with open(file=config_file, mode="r", encoding="utf-8") as f:
+            config_dict = json.load(fp=f)
+
+        model_config = config_dict.get("model_config", config_dict)
+        model = cls(param=Dimensions.from_dict(param=model_config))
+
+        if force_cpu:
+            device = torch.device("cpu")
+        elif device_map is not None:
+            device = torch.device(device_map)
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if torch_dtype is not None:
+            model = model.to(torch_dtype)
+
+        weights_path = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
+        safetensors_path = os.path.join(pretrained_model_name_or_path, "pytorch_model.safetensors")
+        if os.path.exists(safetensors_path):
+            try:
+                from safetensors.torch import load_file as safe_load_file
+                state_dict = safe_load_file(safetensors_path)
+            except ImportError:
+                warnings.warn("safetensors not found. Falling back to torch.load")
+                state_dict = torch.load(weights_path, map_location="cpu")
+        elif os.path.exists(weights_path):
+            state_dict = torch.load(weights_path, map_location="cpu")
+        else:
+            raise ValueError(f"No weights found in {pretrained_model_name_or_path}")
+        model.load_state_dict(state_dict)
+        model = model.to(device)
+        return model
+
 
     def _init_weights(self, module):
         std = 0.02
 
-        if isinstance(module, (nn.Linear, nn.Conv1d)):
-            nn.init.normal_(module.weight, mean=0.0, std=std)
+        if isinstance(module, (Linear, Conv1d)):
+            nn.init.normal_(tensor=module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                nn.init.zeros_(module.bias)
+                nn.init.zeros_(tensor=module.bias)
 
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=std)
+            nn.init.normal_(tensor=module.weight, mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
@@ -1301,20 +1322,20 @@ class Echo(nn.Module):
             module.convx.apply(self._init_weights)
 
         elif isinstance(module, TextDecoder):
-            nn.init.normal_(module.positional_embedding, mean=0.0, std=std)
-            nn.init.normal_(module.token_embedding.weight, mean=0.0, std=std)
+            nn.init.normal_(tensor=module.positional_embedding, mean=0.0, std=std)
+            nn.init.normal_(tensor=module.token_embedding.weight, mean=0.0, std=std)
 
         elif isinstance(module, Residual):
             for layer in module.mlp:
-                if isinstance(layer, nn.Linear):
-                    nn.init.normal_(layer.weight, std=std)
-                    nn.init.zeros_(layer.bias)
+                if isinstance(layer, Linear):
+                    nn.init.normal_(tensor=layer.weight, std=std)
+                    nn.init.zeros_(tensor=layer.bias)
 
             for ln_name in ["ln_a", "ln_b", "ln_c"]:
                 if hasattr(module, ln_name):
                     ln = getattr(module, ln_name)
-                    nn.init.normal_(ln.weight, mean=1.0, std=std)
-                    nn.init.zeros_(ln.bias)
+                    nn.init.normal_(tensor=ln.weight, mean=1.0, std=std)
+                    nn.init.zeros_(tensor=ln.bias)
 
             if hasattr(module, "attn") and hasattr(module.attn, "init_weights"):
                 module.attn.init_weights()
@@ -1350,38 +1371,14 @@ class Echo(nn.Module):
 
         return generated
 
-
-from datetime import datetime
-
-log_dir = os.path.join("./output/Whisper", datetime.now().strftime(format="%m-%d_%H"))
-os.makedirs(name=log_dir, exist_ok=True)
-
-param = Dimensions(
-    mels=128,
-    audio_ctx=1500,
-    audio_head=8,
-    audio_layerA=8,
-    audio_layerB=2,
-    audio_state=1024,
-    vocab=51865,
-    text_ctx=448,
-    text_head=8,
-    text_layerA=8,
-    text_layerB=0,
-    text_state=1024,
-    checkpoint=False,
-    dropout=0.001,
-    activation="gelu",
-)
-
-model = Echo(param=param).to(device=device)
-model.init_weights()
-
 class MaxFactor(torch.optim.Optimizer):
-
-    def __init__(self, params, lr=0.01, beta2_decay=-0.8, eps=(1e-12, 1e-8), d=1.0, 
-                 weight_decay=0.01, gamma=0.99, max=False, full_matrix=False, clip=0, 
-                 lookahead=False, lookahead_k=5):
+    __version__ = "0.5"
+    ## new qwen
+    def __init__(self, params, lr=0.01, beta2_decay=-0.8, eps=(1e-10, 1e-4), d=1.0, 
+                 weight_decay=0.01, gamma=0.99, max=False,
+                 full_matrix=False, clip=0.0):
+        
+        print(f"Using MaxFactor optimizer v{self.__version__}")
         
         eps1, eps2 = eps
         if eps1 is None:
@@ -1389,37 +1386,24 @@ class MaxFactor(torch.optim.Optimizer):
             
         defaults = dict(
             lr=lr, beta2_decay=beta2_decay, eps=(eps1, eps2), d=d, weight_decay=weight_decay, 
-            gamma=gamma, max=max, full_matrix=full_matrix, clip=clip, 
-            lookahead=lookahead, lookahead_k=lookahead_k)
+            gamma=gamma, max=max, full_matrix=full_matrix, clip=clip)
         
         super().__init__(params=params, defaults=defaults)
-          
-    
-    def _get_lr(self, param_group, param_state):
-        step = param_state["step"]
-        min_step = (1e-6 * step + 1e-12)
-        rel_step = min(min_step, 1.0 / step.sqrt())
-        param_scale = max(param_group["eps"][1], param_state["RMS"])
-        return min(param_group["lr"], param_scale * rel_step)
-
+        
     @staticmethod
     def _rms(tensor):
         if tensor.numel() == 0:
             return torch.tensor(0.0, device=tensor.device)
         return tensor.norm() / (tensor.numel() ** 0.5 + 1e-12)
 
-    def _adaptive_clip(self, grad, norm, clip_threshold):
-        return grad * torch.clamp(clip_threshold / (norm + 1e-12), max=1.0)
-
     @torch.no_grad()
     def step(self, closure=None):
-
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
-        for i, group in enumerate(self.param_groups):
+        for group in self.param_groups:
             params_with_grad = []
             grads = []
             row_vars = []
@@ -1437,7 +1421,7 @@ class MaxFactor(torch.optim.Optimizer):
 
                 state = self.state[p]
                 if len(state) == 0:
-                    state["step"] = torch.tensor(0.0, dtype=torch.float32)
+                    state["step"] = torch.tensor(0.0, dtype=torch.float32, device=p.device)
                     
                     if p.dim() > 1 and not group["full_matrix"]:
                         row_shape = list(p.shape)
@@ -1449,7 +1433,6 @@ class MaxFactor(torch.optim.Optimizer):
                         state["col_var"] = torch.zeros(col_shape, dtype=torch.float32, device=p.device)
                     
                     state["v"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    
                     state["RMS"] = self._rms(p).item()
 
                 row_vars.append(state.get("row_var", None))
@@ -1459,17 +1442,17 @@ class MaxFactor(torch.optim.Optimizer):
                 params_with_grad.append(p)
                 grads.append(grad)
 
-            for j, param in enumerate(params_with_grad):
-                grad = grads[j]
+            for i, param in enumerate(params_with_grad):
+                grad = grads[i]
                 state = self.state[param]
                                 
                 if group["max"]:
                     grad = -grad
                     
-                step_t = state_steps[j]
-                row_var = row_vars[j]
-                col_var = col_vars[j]
-                vi = v[j]
+                step_t = state_steps[i]
+                row_var = row_vars[i]
+                col_var = col_vars[i]
+                vi = v[i]
                 
                 step_t += 1
                 step_float = step_t.item()
@@ -1478,62 +1461,156 @@ class MaxFactor(torch.optim.Optimizer):
 
                 state = self.state[param]
                 state["RMS"] = self._rms(param).item()
-                adaptive_lr = self._get_lr(param_group=group, param_state=state)
-                                
+                
                 if group["weight_decay"] != 0:
-                    param.mul_(1 - group["lr"] * group["weight_decay"] + eps1)
-                    
-                norm = grad.norm(2)
-                if norm > group["clip"] > 0:
-                    grad = self._adaptive_clip(grad=grad, norm=norm, clip_threshold=group["clip"])
+                    grad = grad.add(param, alpha=group["weight_decay"])
 
                 if param.dim() > 1 and not group["full_matrix"]:
                     row_mean = torch.norm(grad, dim=-1, keepdim=True).square_()
                     row_mean.div_(grad.size(-1) + eps1)
                     row_var.lerp_(row_mean, one_minus_beta2_t)
-                    
                     col_mean = torch.norm(grad, dim=-2, keepdim=True).square_()
                     col_mean.div_(grad.size(-2) + eps1)
                     col_var.lerp_(col_mean, one_minus_beta2_t)
-                    
                     var_estimate = row_var @ col_var
                     max_row_var = row_var.max(dim=-2, keepdim=True)[0]  
                     var_estimate.div_(max_row_var.clamp_(min=eps1))
                 else:
-                    vi.mul_(group["gamma"]).add_(grad.square_(), alpha=1 - group["gamma"])
+                    vi.mul_(group["gamma"]).add_(grad.square(), alpha=1 - group["gamma"])
                     var_estimate = vi
                     
                 update = var_estimate.clamp_(min=eps1 * eps1).rsqrt_().mul_(grad)
-                  
-                update = update.div_(torch.norm(update, float('inf')).clamp_(min=eps1))
-                denom = max(1.0, update.norm(2).item() / ((update.numel() ** 0.5) * group["d"]))
-                param.add_(update.sign() * update.abs().max(dim=-1, keepdim=True)[0], alpha=-adaptive_lr / denom)
-            
+                inf_norm = torch.norm(update, float('inf'))
+                if inf_norm > 0:
+                    update.div_(inf_norm.clamp_(min=eps1))
+                
+                if group.get("clip", 0) > 0:
+                    torch.nn.utils.clip_grad_norm_([update], max_norm=group["clip"])
+                
+                l2_norm = update.norm(2).item()
+                denom = max(1.0, l2_norm / ((update.numel() ** 0.5) * group["d"]))
+                if param.dim() > 1:
+                    param.add_(update.sign() * update.abs().max(dim=-1, keepdim=True)[0], alpha=-group["lr"] / denom)
+                else:
+                    param.add_(update, alpha=-group["lr"] / denom)
                 state["step"] = step_t
-
         return loss
+    
 
-token=""
 
 extractor = WhisperFeatureExtractor.from_pretrained(
-    pretrained_model_name_or_path="openai/whisper-small", token=token,
-    feature_size=128, sampling_rate=16000, return_tensors="pt", do_normalize=True)
+    pretrained_model_name_or_path="openai/whisper-small", 
+    feature_size=128, sample_rate=16000, do_normalize=True)
 
 tokenizer = WhisperTokenizerFast.from_pretrained(
     pretrained_model_name_or_path="openai/whisper-small", 
-    language="en", task="transcribe", token=token)
+    language="en", task="transcribe")
 
 processor = WhisperProcessor.from_pretrained(
-    pretrained_model_name_or_path="openai/whisper-small", token=token)
+    pretrained_model_name_or_path="openai/whisper-small", 
+    feature_extractor=extractor,
+    tokenizer=tokenizer)
+    
+def process_fn(batch): # type: ignore
+    return prepare_dataset(batch=batch, extractor=extractor, tokenizer=tokenizer)
+    
+def prepare_dataset(batch, extractor, tokenizer): # type: ignore
+    audio = batch["audio"]
+    batch["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+    batch["labels"] = tokenizer(batch["sentence"]).input_ids
+    return batch
 
+def prepare_dataset_with_columns(batch, extractor, tokenizer): # type: ignore
+    result = {}
+    audio = batch["audio"]
+    result["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+    result["labels"] = tokenizer(batch["sentence"]).input_ids
+    return result
+    
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding: # type: ignore
+    processor: Any
+    extractor: Any
+    tokenizer: Any
+    decoder_start_token_id=50258
+    pad_token_id=50257
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        input_features = [{"input_features": feature["input_features"]} for feature in features]
+        batch = self.extractor.pad(input_features, return_tensors="pt")
+        
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        
+        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+            labels = labels[:, 1:]
+        
+        batch["labels"] = labels
+      
+        batch["input_ids"] = Echo.shift_tokens_right(
+            input_ids=labels,
+            pad_token_id=self.pad_token_id,
+            decoder_start_token_id=self.decoder_start_token_id
+        )
+        return batch
+
+metric = evaluate.load(path="wer")
+
+def compute_metrics(pred, tokenizer):
+    pred_ids = pred["predictions"]
+    label_ids = pred["label_ids"]
+    if isinstance(pred_ids, tuple):
+        pred_ids = pred_ids[0]
+    else:
+        pred_ids = pred_ids
+    if pred_ids.ndim == 3:
+        pred_ids = np.argmax(pred_ids, axis=-1)
+    label_ids[label_ids == -100] = tokenizer.pad_token_id
+    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    wer = 100 * metric.compute(predictions=pred_str, references=label_str) # type: ignore
+    return {"wer": wer}
+
+
+extractor = WhisperFeatureExtractor.from_pretrained(
+    pretrained_model_name_or_path="openai/whisper-small", 
+    feature_size=128, sample_rate=16000, do_normalize=True)
+
+tokenizer = WhisperTokenizerFast.from_pretrained(
+    pretrained_model_name_or_path="openai/whisper-small", 
+    language="en", task="transcribe")
+
+processor = WhisperProcessor.from_pretrained(
+    pretrained_model_name_or_path="openai/whisper-small", 
+    feature_extractor=extractor,
+    tokenizer=tokenizer)
+    
+def process_fn(batch):
+    return prepare_dataset(batch=batch, extractor=extractor, tokenizer=tokenizer)
+    
+def prepare_dataset(batch, extractor, tokenizer):
+    audio = batch["audio"]
+    batch["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+    batch["labels"] = tokenizer(batch["sentence"]).input_ids
+    return batch
+
+def prepare_dataset_with_columns(batch, extractor, tokenizer):
+    result = {}
+    audio = batch["audio"]
+    result["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+    result["labels"] = tokenizer(batch["sentence"]).input_ids
+    return result
+    
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
     extractor: Any
     tokenizer: Any
-    decoder_start_token_id: int
+    decoder_start_token_id=50258
+    pad_token_id=50257
 
-    def __call__(self, features: List[Dict[str, Union[List[int], Tensor]]]) -> Dict[str, Tensor]:
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         input_features = [{"input_features": feature["input_features"]} for feature in features]
         batch = self.extractor.pad(input_features, return_tensors="pt")
         label_features = [{"input_ids": feature["labels"]} for feature in features]
@@ -1542,140 +1619,308 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
         batch["labels"] = labels
+        batch["input_ids"] = Echo.shift_tokens_right(
+            input_ids=labels,
+            pad_token_id=self.pad_token_id,
+            decoder_start_token_id=self.decoder_start_token_id)
         return batch
+
+
+
+
+def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn, 
+                      max_steps=10000, device='cuda', accumulation_steps=1, clear_cache=True, 
+                      log_interval=10, eval_interval=100, save_interval=1000, 
+                      checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
+    model.to(device)
+    global_step = 0
+    scaler = GradScaler()
+    writer = SummaryWriter(log_dir=log_dir)
+    train_iterator = iter(train_loader)
+    total_loss = 0
+    step_in_report = 0
+    dataset_epochs = 0
     
-def prepare_dataset(batch):
-    audio = batch["audio"]
-    batch["input_features"] = extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-    batch["labels"] = tokenizer(batch["sentence"]).input_ids
-    return batch
-
-data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-    processor=processor, extractor=extractor,
-    tokenizer=tokenizer, decoder_start_token_id=50258)
-
-dataset = IterableDatasetDict()
-
-dataset["train"] = load_dataset(
-    path="mozilla-foundation/common_voice_17_0", split="train",
-    name="en", streaming=True, token=token, 
-    trust_remote_code=True, save_infos=True)#.shuffle()#.take(10000)
-
-dataset["test"] = load_dataset(
-    path="mozilla-foundation/common_voice_17_0",
-    name="en", split="test", streaming=True, 
-    token=token, trust_remote_code=True, save_infos=True).take(500)
-
-dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
-
-dataset = dataset.map(function=prepare_dataset, 
-    remove_columns=list(next(iter(dataset.values()))
-                        .features)).with_format(type="torch")
-
-metric = evaluate.load(path="wer")
-
-def compute_metrics(eval_pred):
-    pred_logits = eval_pred.predictions
-    label_ids = eval_pred.label_ids
-
-    if isinstance(pred_logits, tuple):
-        pred_ids = pred_logits[0]
-    else:
-        pred_ids = pred_logits
-    if pred_ids.ndim == 3:
-        pred_ids = np.argmax(pred_ids, axis=-1)
-
-    label_ids[label_ids == -100] = tokenizer.pad_token_id
-    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer = 100 * metric.compute(predictions=pred_str, references=label_str) # type: ignore
-    pred_flat = pred_ids.flatten()
-    labels_flat = label_ids.flatten()
-    mask = labels_flat != tokenizer.pad_token_id
-  
-    if len(pred_str) > 0:
-        sample_idx = random.randint(0, len(pred_str) - 1)
-        print("-" * 10)
-        print(f"Prediction: {pred_str[sample_idx]}")
-        print(f"Label: {label_str[sample_idx]}")
-        print("-" * 10)
-
-    acc = accuracy_score(y_true=labels_flat[mask], y_pred=pred_flat[mask])
-    pre = precision_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
-    average='weighted', zero_division=0)
-    rec = recall_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
-    average='weighted', zero_division=0)
-    f1 = f1_score(y_true=labels_flat[mask], y_pred=pred_flat[mask], 
-    average='weighted', zero_division=0)
+    progress_bar = tqdm(total=max_steps, desc="Training")
     
-    return {
-        "wer": wer,
-        "accuracy": acc,
-        "precision": pre,
-        "recall": rec,
-        "f1": f1}
+    model.train()
+    optimizer.zero_grad()
     
-log_dir = os.path.join(os.getcwd(), "whisper_training_logs")
-os.makedirs(log_dir, exist_ok=True)
+    while global_step < max_steps:
+        try:
+            batch = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(train_loader)
+            batch = next(train_iterator)
+            
+            dataset_epochs += 1
+            print(f"Starting dataset epoch {dataset_epochs}")
+            
+            if step_in_report > 0:
+                avg_loss = total_loss / step_in_report if step_in_report > 0 else 0
+                logging.info(f"Dataset iteration complete - Steps: {global_step}, Avg Loss: {avg_loss:.4f}")
+                total_loss = 0
+                step_in_report = 0
+        
+        start_time = time.time()
 
-args = Seq2SeqTrainingArguments(
-    output_dir=log_dir,
-    per_device_train_batch_size=1,
-    per_device_eval_batch_size=1,
-    gradient_accumulation_steps=1,
-    eval_accumulation_steps=1,
-    tf32=True,
-    bf16=True,
-    eval_strategy="steps",
-    save_strategy="steps",
-    max_steps=100000,
-    save_steps=1000,
-    eval_steps=1000,
-    warmup_steps=300,
-    num_train_epochs=1,
-    logging_steps=1,
-    logging_dir=os.path.join(log_dir, "logs_hf"),
-    report_to=["tensorboard"],
-    push_to_hub=False,
-    disable_tqdm=False,
-    save_total_limit=1,
-    remove_unused_columns=False,
-    label_names=["labels"],
-    eval_on_start=False,
-    # optim="adafactor",
-)
+        input_features = batch['input_features'].to(device)
+        input_ids = batch['input_ids'].to(device)
+        labels = batch['labels'].long().to(device)
+        
+        with torch.autocast(device_type='cuda'):
+            if global_step % 100 == 0:
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                    with record_function("model_training"):
+                        input_features_encoded = model.encoder(input_features)
+                        decoder_output = model.decoder(input_ids, input_features_encoded)
+            else:
+                input_features_encoded = model.encoder(input_features)
+                decoder_output = model.decoder(input_ids, input_features_encoded)
+        
+        logits = decoder_output.view(-1, decoder_output.size(-1))
+        
+        active_logits = logits.view(-1, decoder_output.size(-1))
+        active_labels = labels.view(-1)
+        active_mask = active_labels != tokenizer.pad_token_id
+        active_logits = active_logits[active_mask]
+        active_labels = active_labels[active_mask]
+        loss = loss_fn(active_logits, active_labels)
+        
+        total_loss += loss.item()
+        loss = loss / accumulation_steps
 
-optimizer = MaxFactor(
-    model.parameters(), 
-    lr=0.01,  
-    beta2_decay=-0.8,
-    eps=(1e-10, 1e-4),  
-    d=1.0,
-    weight_decay=0.01,  
-    gamma=0.99,         
-    eps_rms=1e-8,
-    maximize=False,
-)
+        scaler.scale(loss).backward()
 
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer=optimizer,
-    T_max=args.max_steps,
-    eta_min=0.0,
-    last_epoch=-1  
-)
+        if (global_step + 1) % accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer=optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
-trainer = Seq2SeqTrainer(
-    args=args,
-    model=model,
-    train_dataset=dataset["train"],
-    eval_dataset=dataset["test"],
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    processing_class=extractor,
-    optimizers=(optimizer, scheduler),
-)
+            if clear_cache:
+                torch.cuda.empty_cache()
+
+        end_time = time.time()
+        samples_per_sec = len(batch['input_features']) / (end_time - start_time)
+
+        if global_step % log_interval == 0:
+            writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (global_step + 1), global_step=global_step)
+            
+            lr = optimizer.param_groups[0].get('lr', None)
+            if lr is not None:
+                writer.add_scalar('LearningRate', scalar_value=lr, global_step=global_step)
+            else:
+                if not lr_warning_printed:
+                    print(f"Warning: Learning rate is None at step {global_step}")
+                    lr_warning_printed = True
+
+            writer.add_scalar(tag='SamplesPerSec', scalar_value=samples_per_sec, global_step=global_step)
+
+        if global_step % eval_interval == 0:
+            model.eval()
+            eval_start_time = time.time()
+            eval_loss = 0
+            all_predictions = []
+            all_labels = []
+            batch_count = 0
+            total_samples = 0
+            
+            with torch.no_grad():
+                for eval_batch in tqdm(eval_loader, desc=f"Evaluating (Step {global_step})", leave=False):
+                    input_features = eval_batch['input_features'].to(device)
+                    input_ids = eval_batch['input_ids'].to(device)
+                    labels = eval_batch['labels'].long().to(device)
+                    
+                    batch_size = input_features.size(0)
+                    total_samples += batch_size
+                    
+                    input_features_encoded = model.encoder(input_features)
+                    decoder_output = model.decoder(input_ids, input_features_encoded)
+                    logits = decoder_output.view(-1, decoder_output.size(-1))
+                    loss = loss_fn(logits, labels.view(-1))
+                    eval_loss += loss.item()
+                    all_predictions.extend(torch.argmax(decoder_output, dim=-1).cpu().numpy().tolist())
+                    all_labels.extend(labels.cpu().numpy().tolist())
+                    batch_count += 1
+
+            eval_time = time.time() - eval_start_time
+            eval_loss_avg = eval_loss / batch_count if batch_count > 0 else 0
+            predictions = {"predictions": np.array(all_predictions, dtype=object), "label_ids": np.array(all_labels, dtype=object)}
+            metrics = compute_metrics(pred=predictions, tokenizer=tokenizer)
+            
+            writer.add_scalar('Loss/eval', eval_loss_avg, global_step)
+            writer.add_scalar('WER', metrics['wer'], global_step)
+            writer.add_scalar('EvalSamples', total_samples, global_step)
+            writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
+            
+            lr = optimizer.param_groups[0].get('lr', 0)
+            
+            print("\n" + "="*80)
+            print(f"EVALUATION REPORT - STEP {global_step}")
+            print("="*80)
+            print(f"Metrics:")
+            print(f"  • Loss:               {eval_loss_avg:.4f}")
+            print(f"  • Word Error Rate:    {metrics['wer']:.2f}%")
+            print(f"  • Character Error Rate: {metrics.get('cer', 0):.2f}%")
+            print(f"Stats:")
+            print(f"  • Learning Rate:      {lr:.8f}")
+            print(f"  • Eval Batches:       {batch_count}")
+            print(f"  • Eval Samples:       {total_samples}")
+            print(f"  • Eval Time:          {eval_time:.2f}s ({total_samples/eval_time:.2f} samples/sec)")
+            print(f"  • Training Speed:     {samples_per_sec:.2f} samples/sec")
+            
+            if len(all_predictions) > 0:
+                print("\nSample Predictions:")
+                sample_indices = range(min(3, len(all_predictions)))
+                for idx in sample_indices:
+                    pred_str = tokenizer.decode(all_predictions[idx], skip_special_tokens=True)
+                    label_str = tokenizer.decode(all_labels[idx], skip_special_tokens=True)
+                    print(f"  Example {idx+1}:")
+                    print(f"    • Reference: {label_str}")
+                    print(f"    • Prediction: {pred_str}")
+            print("="*80 + "\n")
+            
+            logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {eval_loss_avg:.4f}, LR: {lr:.8f}")
+            scheduler.step(eval_loss_avg)
+            model.train()
+
+        if global_step % save_interval == 0:
+            checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{global_step}.pt')
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"Model saved at step {global_step} to {checkpoint_path}")
+            logging.info(f"Model saved at step {global_step} to {checkpoint_path}")
+
+        if global_step % 5000 == 0 and global_step > 0:
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        global_step += 1
+        step_in_report += 1
+        progress_bar.update(1)
+        
+    final_model_path = os.path.join(checkpoint_dir, 'final_model.pt')
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Training completed after {global_step} steps. Final model saved to {final_model_path}")
+    writer.close()
+    progress_bar.close()
 
 
-trainer.train(resume_from_checkpoint=False)
+
+
+if __name__ == "__main__":
+
+    checkpoint_dir = './output/checkpoints'
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    log_dir = os.path.join("./output/logs", datetime.now().strftime(format="%m-%d_%H"))
+    os.makedirs(name=log_dir, exist_ok=True)
+
+    logging.basicConfig(
+        filename=os.path.join(log_dir, 'training.log'), filemode='w', format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+    token=""
+
+    extractor = WhisperFeatureExtractor.from_pretrained(
+        pretrained_model_name_or_path="openai/whisper-small", 
+        feature_size=128, sample_rate=16000, do_normalize=True)
+
+    tokenizer = WhisperTokenizerFast.from_pretrained(
+        pretrained_model_name_or_path="openai/whisper-small", 
+        language="en", task="transcribe")
+
+    processor = WhisperProcessor.from_pretrained(
+        pretrained_model_name_or_path="openai/whisper-small", 
+        feature_extractor=extractor,
+        tokenizer=tokenizer)
+
+    dataset = IterableDatasetDict()
+
+    dataset["train"] = load_dataset(
+        path="mozilla-foundation/common_voice_17_0", split="train",
+        name="en", streaming=True, token=token, 
+        trust_remote_code=True)#.shuffle()#.take(10000)
+
+    dataset["test"] = load_dataset(
+        path="mozilla-foundation/common_voice_17_0",
+        name="en", split="test", streaming=True, 
+        token=token, trust_remote_code=True).take(500) #type: ignore
+    
+    dataset = dataset.cast_column(column="audio", feature=Audio(sampling_rate=16000))
+    dataset = dataset.map(function=process_fn).with_format(type="torch")                       
+    dataset = dataset.select_columns(column_names=["labels", "input_features"])
+
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+        processor=processor, extractor=extractor,
+        tokenizer=tokenizer)
+
+    train_dataloader = DataLoader(
+        dataset=dataset["train"], 
+        batch_size=1, 
+        collate_fn=data_collator,
+        num_workers=0 )
+
+    eval_dataloader = DataLoader(
+        dataset=dataset["test"],
+        batch_size=1,
+        collate_fn=data_collator,
+        num_workers=0 )
+    
+    param = Dimensions(
+        mels=128,
+        audio_ctx=1500,
+        audio_head=4,
+        audio_layerA=4,
+        audio_layerB=0,
+        audio_state=512,
+        vocab=51865,
+        text_ctx=448,
+        text_head=4,
+        text_layerA=4,
+        text_layerB=0,
+        text_state=512,
+        checkpoint=False,
+        dropout=0.001,
+        activation="gelu",
+    )
+
+    model = Echo(param=param).to(device=device)
+    model.init_weights()
+
+    # optimizer = MaxFactor(params=model.parameters())
+    # # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=100000, eta_min=0)
+    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    # optimizer=optimizer, mode='min', factor=0.5, patience=0, threshold=0.0001, min_lr=0.000001)
+
+    optimizer = torch.optim.Adafactor(params=model.parameters(), lr=0.01, 
+                        beta2_decay=-0.8, eps=(1e-12, 1e-4), 
+                        d=1.0, weight_decay=0.0, 
+                        foreach=None, maximize=False)
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer=optimizer, mode='min', factor=0.025, patience=0, threshold=0.000001, min_lr=0.000001)
+
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda _: 1.0)
+    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+    train_and_evaluate(model=model, 
+        tokenizer=tokenizer, 
+        train_loader=train_dataloader, 
+        eval_loader=eval_dataloader, 
+        optimizer=optimizer, 
+        scheduler=scheduler, 
+        loss_fn=loss_fn, 
+        max_steps=100000,
+        device='cuda', 
+        accumulation_steps=1, 
+        clear_cache=True, 
+        log_interval=10, 
+        eval_interval=2000, 
+        save_interval=25000, 
+        checkpoint_dir=checkpoint_dir, 
+        log_dir=log_dir
+        )
+
 
 
