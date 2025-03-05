@@ -1,0 +1,63 @@
+   
+class AudioEncoder(nn.Module):
+    def __init__(self, param: Dimensions, mels: int, ctx: int, dims: int, heads: int, 
+                checkpoint: bool, dropout: float, activation: str, layerA: int, layerB: int, debug=False):
+        
+        if debug == True:
+            print(f"AudioEncoder check: {param} {mels} {ctx} {dims} {heads} {checkpoint} {dropout} {activation} {layerA} {layerB}")
+        
+        super().__init__()
+        
+        self.checkpoint = checkpoint
+
+        act_map = {
+            "gelu": nn.GELU(),
+            "relu": nn.ReLU(),
+            "sigmoid": nn.Sigmoid(),
+            "tanh": nn.Tanh(),
+            "leaky_relu": nn.LeakyReLU(),
+            "elu": nn.ELU(),
+        }
+        act = act_map.get(activation, nn.ReLU())
+
+        self.rotation = rotary(ctx=ctx, dims=dims, heads=heads, base=10000)
+        self.position = sinusoids(length=ctx, channels=dims)
+        self.register_buffer("positions", self.position, persistent=False)
+
+        self.convx = nn.Sequential(
+            Conv1d(mels, dims, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(dims),
+            act,
+            nn.Dropout(p=dropout),
+            Conv1d(dims, dims, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm1d(dims),
+            act,
+            nn.Dropout(p=dropout),
+        )
+
+        for m in self.convx:
+            if isinstance(m, Conv1d):
+                nn.init.kaiming_normal_(m.weight)
+
+        self.blockA = nn.ModuleList([
+            Residual(param, dims, heads, dropout, activation) 
+            for _ in range(layerA)]) if layerA > 0 else None
+
+        self.blockB = nn.ModuleList([
+            FocusA(dims=dims, heads=heads, max_dist=ctx) 
+            for _ in range(layerB)]) if layerB > 0 else None
+
+        self.ln_post = LayerNorm(dims)
+
+    def forward(self, x) -> Tensor:
+        x = checkpoint(self._forward, x, use_reentrant=True) if self.checkpoint else self._forward(x)
+        for block in chain(self.blockB or [], self.blockA or []):
+            x = checkpoint(block, x, use_reentrant=True) if self.checkpoint else block(x)  
+        return self.ln_post(x)
+
+    def _forward(self, x) -> Tensor:
+        x = F.gelu(self.convx(x))
+        x = x.permute(0, 2, 1)  
+        x = (x + self.positions).to(x.dtype)  # type: ignore
+        x = self.rotation(x)
+        return x
