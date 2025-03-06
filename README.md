@@ -1,3 +1,6 @@
+Sorry folks.. This has been a fucking big waste of time. 
+There is no competing with the big dollars.
+
 in progress... I'm a one person show.. Testing has become my bottleneck. Note to self, don't let an AI edit code. They are helpful with many things but ninja at breaking code.
 
 I switched to a pytorch loop because I feel that it's more flexible and less of a headache but I decided to keep hf datasets because I like datasets. I changed the token shifting (which should never have been part of the model) to an optional toggle in case someone still wants to use hf trainer. I moved the shifting to the collator (where it should be). If you toggle on shifting in the model forward make sure to use the collator without shifting. It won't like the double shift. 
