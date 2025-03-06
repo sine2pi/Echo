@@ -1,5 +1,5 @@
 Sorry folks.. This has been a fucking big waste of time. 
-There is no competing with the big dollars.
+There is no competing with the big dollars. 
 
 in progress... I'm a one person show.. Testing has become my bottleneck. Note to self, don't let an AI edit code. They are helpful with many things but ninja at breaking code.
 
