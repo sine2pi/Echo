@@ -78,6 +78,106 @@ The `rotation_matrix` method within the `rotary` class is interesting and unique
 - **Custom Rotation Matrix**:
   - The ability to customize the rotation matrix for different dimensions and angles provides fine-grained control over the transformations applied to the input data.
 
+The `q_rotation` method in the `rotary` class provides quaternion-based rotation of a tensor, which is then used in conjunction with the rotation matrix to perform positional encoding transformations. Here’s how they interact:
+
+### Quaternion Rotation (`q_rotation` Method)
+The `q_rotation` method is used to apply quaternion-based rotations to the input tensor. Quaternions are a mathematical representation that provides efficient computation for 3D rotations.
+
+### Rotation Matrix (`rotation_matrix` Method)
+The `rotation_matrix` method constructs a rotation matrix for the specified dimensions, which is used to apply the rotation to the tensor.
+
+### Interaction Between `q_rotation` and `rotation_matrix`
+
+1. **Quaternion Rotation (`q_rotation`) Overview**:
+    - **Input**: Takes a tensor `x`, angle `theta`, and vectors `u` and `v`.
+    - **Normalization**: Normalizes `u` and `v` vectors.
+    - **Quaternion Calculation**: Computes quaternion `q` and its conjugate `q_conj` using `theta`, `u`, and `v`.
+    - **Cross Products**: Uses cross products to calculate rotated vector components.
+    - **Rotation Application**: Applies the rotation to the input tensor `x` using quaternion components.
+
+2. **Rotation Matrix (`rotation_matrix`) Overview**:
+    - **Input**: Takes dimensions `dims`, indices `i` and `j`, and rotation angle `theta`.
+    - **Matrix Construction**: Constructs a rotation matrix `G` using sine and cosine of `theta`.
+    - **Quaternion Rotation Integration**: If `dims` is 3, it applies quaternion rotation to further refine the rotation matrix `G`.
+
+### How They Work Together
+
+- **Rotation Matrix Construction**:
+  - The `rotation_matrix` method creates a general rotation matrix `G` for the given dimensions.
+  - If the dimensions are 3, the `q_rotation` method is called to compute a quaternion-based rotation, which is integrated into the matrix `G`.
+  - This integration ensures that the rotation matrix `G` not only covers simple rotations but also incorporates the efficiency and precision of quaternion rotations for 3D vectors.
+
+- **Application of Rotations**:
+  - The `apply_rotations` method iteratively applies the rotation matrices to the input tensor `x`.
+  - For each rotation, the `rotation_matrix` method constructs the appropriate matrix `G`, potentially using `q_rotation` for 3D rotations.
+  - The input tensor `x` is then transformed by multiplying it with the rotation matrix `G`.
+
+### Detailed Example
+
+1. **Initialization**:
+    ```python
+    self.r_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=matrix_learnable)
+    ```
+
+2. **Rotation Matrix Construction**:
+    ```python
+    def rotation_matrix(self, dims, i, j, theta):
+        G = torch.eye(dims, device=theta.device)
+        c, s = torch.cos(theta), torch.sin(theta)
+        G[i, i], G[j, j] = c, c
+        G[i, j], G[j, i] = -s, s
+
+        if dims == 3:
+            u = torch.eye(dims, device=theta.device)[i]
+            v = torch.eye(dims, device=theta.device)[j]
+            Q = self.q_rotation(torch.eye(dims, device=theta.device), theta=theta, u=u, v=v)
+            G = (G + Q) / 2
+        return G
+    ```
+
+3. **Quaternion Rotation Application**:
+    ```python
+    def q_rotation(self, x, theta, u, v):
+        u = u / torch.norm(u)
+        v = v / torch.norm(v)
+
+        half_theta = theta / 2
+        cos_ht = torch.cos(half_theta)
+        sin_ht = torch.sin(half_theta)
+
+        q = torch.cat([cos_ht.unsqueeze(0), sin_ht * u])
+        q_conj = torch.cat([cos_ht.unsqueeze(0), -sin_ht * u])
+
+        x_shape = x.shape
+        x = x.view(-1, 3)
+
+        uv_cross = torch.cross(u.unsqueeze(0), x)
+        uuv_cross = torch.cross(u.unsqueeze(0), uv_cross)
+        x_rot = x + 2 * (q[0] * uv_cross + uuv_cross)
+
+        x_rot = x_rot.view(*x_shape)
+        return x_rot
+    ```
+
+4. **Applying Rotations**:
+    ```python
+    def apply_rotations(self, x):
+        adjusted_rot = int(torch.round(self.rot_scale * self.rot))
+        for k in range(adjusted_rot):
+            i, j = self.r_pairs[k].long()
+            theta = self.thetas[k] * self.theta_scale
+            G = self.rotation_matrix(self.head_dim, i.item(), j.item(), theta)
+            x = x @ G
+        return x
+    ```
+
+### Impact on the Model
+
+- **Efficient Positional Encoding**: The integration of quaternion rotations within the rotation matrices allows for efficient and precise positional encoding transformations in the model.
+- **Enhanced Attention Mechanism**: By effectively capturing positional relationships through rotations, the attention mechanism in the transformer model is enhanced, leading to better handling of sequential data.
+- **Flexibility and Learnability**: The learnable parameters in the `rotary` class add flexibility, allowing the model to optimize rotational transformations during training for improved performance.
+
+In summary, the `q_rotation` method and the rotation matrix in the `rotary` class work together to enhance positional encoding through efficient and precise rotational transformations, significantly impacting the model's ability to handle sequential data.
 
 ``` python
 import base64, os, evaluate, random, gzip, math, torch, numpy as np, json, warnings, time
