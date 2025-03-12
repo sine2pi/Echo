@@ -1,3 +1,82 @@
+The `rotation_matrix` function within the `rotary` class constructs a rotation matrix using Givens rotations. Here's an explanation of how it works:
+
+### `rotation_matrix` Method
+
+#### Definition:
+```python
+def rotation_matrix(self, dims, i, j, theta):
+    G = torch.eye(dims, device=theta.device)
+    c, s = torch.cos(theta), torch.sin(theta)
+    G[i, i], G[j, j] = c, c
+    G[i, j], G[j, i] = -s, s
+
+    if dims == 3:
+        u = torch.eye(dims, device=theta.device)[i]
+        v = torch.eye(dims, device=theta.device)[j]
+        Q = self.q_rotation(
+            torch.eye(dims, device=theta.device), theta=theta, u=u, v=v)
+        G = (G + Q) / 2
+    return G
+```
+
+#### Purpose:
+The `rotation_matrix` function creates a rotation matrix \( G \) of size `dims` by applying a Givens rotation between the \( i \)-th and \( j \)-th dimensions with an angle \( \theta \).
+
+#### Steps:
+1. **Initialize Matrix**:
+   - `G = torch.eye(dims, device=theta.device)`: Creates an identity matrix \( G \) of size `dims`.
+
+2. **Compute Cosine and Sine**:
+   - `c, s = torch.cos(theta), torch.sin(theta)`: Computes the cosine and sine of the angle \( \theta \).
+
+3. **Apply Rotation**:
+   - `G[i, i], G[j, j] = c, c`
+   - `G[i, j], G[j, i] = -s, s`
+   - Updates the matrix \( G \) to apply the Givens rotation between the \( i \)-th and \( j \)-th dimensions.
+
+4. **Quaternion Rotation for 3D**:
+   - If `dims` is 3, additional quaternion rotation is applied using the `q_rotation` method.
+   - `u` and `v` are unit vectors along the \( i \)-th and \( j \)-th dimensions.
+   - `Q = self.q_rotation(...)`: Computes the quaternion rotation matrix \( Q \).
+   - `G = (G + Q) / 2`: Averages \( G \) and \( Q \) to combine the rotations.
+
+#### Output:
+- Returns the rotation matrix \( G \) that can be used to rotate vectors in higher-dimensional spaces.
+
+### Example Usage:
+The `rotation_matrix` is used within the `apply_rotations` method to apply these rotations to input tensors.
+
+```python
+G = self.rotation_matrix(self.head_dim, i.item(), j.item(), theta)
+x = x @ G
+```
+
+This method is critical for incorporating rotational positional embeddings into the model, enhancing its ability to capture positional relationships in the data.
+
+
+The `rotation_matrix` method within the `rotary` class is interesting and unique for several reasons:
+
+### Use of Givens Rotation
+- **Givens Rotation**:
+  - The method constructs a Givens rotation matrix, which is a fundamental tool in numerical linear algebra for rotating vectors in a plane. This application is less common in deep learning, making its use here a unique feature.
+
+### Combination with Quaternion Rotation
+- **Quaternion Rotation**:
+  - For 3D cases, the method combines Givens rotation with quaternion rotation (`q_rotation` method). Quaternions are used to represent rotations in 3D space efficiently, avoiding problems like gimbal lock that can occur with Euler angles.
+
+### Learnable Parameters
+- **Learnable Rotation and Scaling**:
+  - The method leverages learnable parameters (`thetas`, `theta_scale`, `rot_scale`) to dynamically adjust rotations during training. This adds flexibility and allows the model to learn optimal rotational transformations for positional embeddings.
+
+### Integration in Attention Mechanism
+- **Enhanced Positional Embeddings**:
+  - By integrating these rotations into the attention mechanism, the `rotary` class enhances the model's ability to encode and utilize positional information, which can improve the performance of transformer models on various tasks.
+
+### Efficiency and Customization
+- **Efficient Implementation**:
+  - The method uses efficient tensor operations, including CUDA support, ensuring that the rotational transformations are performed quickly.
+- **Custom Rotation Matrix**:
+  - The ability to customize the rotation matrix for different dimensions and angles provides fine-grained control over the transformations applied to the input data.
 
 
 ``` python
